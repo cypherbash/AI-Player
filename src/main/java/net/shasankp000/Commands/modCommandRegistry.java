@@ -534,13 +534,14 @@ public class modCommandRegistry {
                                                         return 0;
                                                     }
 
-                                                    net.shasankp000.FunctionCaller.FunctionCallerV2.initializePlanner(bot, rlAgent);
+                                                    var functionCaller = new net.shasankp000.FunctionCaller.FunctionCallerV2(botSource, context.getSource().getPlayer().getUUID());
+                                                    functionCaller.initializePlanner(bot, rlAgent);
 
                                                     net.shasankp000.GameAI.State currentState = BotEventHandler.getCurrentState();
 
                                                     ChatUtils.sendChatMessages(botSource, "Planning: " + goal + "...");
 
-                                                    net.shasankp000.FunctionCaller.FunctionCallerV2.handleUserGoal(goal, currentState, bot, rlAgent, botSource)
+                                                    functionCaller.handleUserGoal(goal, currentState, bot, rlAgent, botSource)
                                                             .thenAccept(success -> {
                                                                 server.execute(() -> {
                                                                     if (success) {

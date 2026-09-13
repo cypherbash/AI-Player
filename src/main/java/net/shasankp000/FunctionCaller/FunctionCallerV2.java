@@ -77,47 +77,51 @@ public class FunctionCallerV2 {
 
     private static final Logger logger = LoggerFactory.getLogger("function-caller");
 
-    private static CommandSourceStack botSource = null;
+    private CommandSourceStack botSource = null;
 
     private static final String DB_URL = "jdbc:sqlite:" + "./sqlite_databases/" + "memory_agent.db";
 
     private static final String host = "http://localhost:11434/";
 
-    private static final OllamaAPI ollamaAPI = new OllamaAPI(host);
+    private final OllamaAPI ollamaAPI = new OllamaAPI(host);
 
-    private static volatile String functionOutput = null;
+    private final ActionExecutionState actionState = new ActionExecutionState();
 
     private static final ExecutorService executor = Executors.newFixedThreadPool(4);
 
-    private static final Map<String, Object> sharedState = new ConcurrentHashMap<>();  // Updated to Map<String, Object>
+    private final Map<String, Object> sharedState = actionState.values;
 
-    private static UUID playerUUID;
+    private UUID playerUUID;
+    private final long cancellationVersion;
 
     private static final Pattern THINK_BLOCK = Pattern.compile("<think>([\\s\\S]*?)</think>", Pattern.DOTALL);
 
     private static final String selectedLM = AIPlayer.CONFIG.getSelectedLanguageModel();
 
     // Markov Planner components (initialized on first use)
-    private static Planner planner = null;
-    private static ActionLogWriter actionLogWriter = null;
-    private static MarkovChain2 markovChain = null;
+    private Planner planner = null;
+    private ActionLogWriter actionLogWriter = null;
+    private MarkovChain2 markovChain = null;
     private static final double SAFE_THRESHOLD = 50.0;
 
     // Hybrid Planner components (advanced goal-oriented planning)
-    private static HybridPlanner hybridPlanner = null;
-    private static boolean useHybridPlanner = true; // Toggle between planners
+    private HybridPlanner hybridPlanner = null;
+    private boolean useHybridPlanner = true; // Toggle between planners
+
+    public static boolean isExecuting(UUID bot) { return ExecutionLease.isActive(bot); }
 
     public FunctionCallerV2(CommandSourceStack botSource, UUID playerUUID) {
-        FunctionCallerV2.botSource = botSource;
+        this.botSource = botSource;
         ollamaAPI.setRequestTimeoutSeconds(90);
-        FunctionCallerV2.playerUUID = playerUUID;
+        this.playerUUID = playerUUID;
+        this.cancellationVersion = NavigationService.cancellationVersion(botSource.getPlayer().getUUID());
     }
 
     /**
      * Initialize the Markov planner system.
      * Should be called once during bot initialization.
      */
-    public static void initializePlanner(ServerPlayer bot, net.shasankp000.GameAI.RLAgent rlAgent) {
+    public void initializePlanner(ServerPlayer bot, net.shasankp000.GameAI.RLAgent rlAgent) {
         if (markovChain == null) {
             logger.info("[planner] Initializing Markov-based planner system...");
 
@@ -165,7 +169,7 @@ public class FunctionCallerV2 {
      * @param botSource Bot's command source (required for function execution)
      * @return CompletableFuture that completes when plan execution finishes
      */
-    public static CompletableFuture<Boolean> handleUserGoal(
+    public CompletableFuture<Boolean> handleUserGoal(
             String naturalLanguageGoal,
             State currentState,
             ServerPlayer bot,
@@ -173,7 +177,7 @@ public class FunctionCallerV2 {
             CommandSourceStack botSource) {
 
         // ✅ Store botSource for function execution
-        FunctionCallerV2.botSource = botSource;
+        this.botSource = botSource;
 
         // Ensure planner is initialized
         if (planner == null) {
@@ -233,7 +237,7 @@ public class FunctionCallerV2 {
      * Fallback to LLM-based planning when Markov planner fails.
      * Generates pipeline using language model and executes it.
      */
-    private static CompletableFuture<Boolean> fallbackToLLM(String goal, State currentState) {
+    private CompletableFuture<Boolean> fallbackToLLM(String goal, State currentState) {
         logger.info("[planner] 🤖 LLM fallback for goal: '{}'", goal);
 
         return CompletableFuture.supplyAsync(() -> {
@@ -271,34 +275,14 @@ public class FunctionCallerV2 {
                 String jsonPart = extractJson(cleanedResponse);
                 logger.info("[planner] Extracted JSON: {}", jsonPart);
 
-                JsonObject jsonObject = JsonParser.parseString(jsonPart).getAsJsonObject();
+                JsonObject jsonObject = PipelineSchema.normalize(JsonParser.parseString(jsonPart));
 
                 if (jsonObject.has("pipeline")) {
                     JsonArray pipeline = jsonObject.getAsJsonArray("pipeline");
                     logger.info("[planner] ✓ LLM generated pipeline with {} steps", pipeline.size());
 
                     // Execute pipeline using existing runPipelineLoop
-                    runPipelineLoop(pipeline);
-                    return true;
-
-                } else if (jsonObject.has("functionName")) {
-                    // Single function call
-                    String fnName = jsonObject.get("functionName").getAsString();
-                    JsonArray paramsArray = jsonObject.getAsJsonArray("parameters");
-                    Map<String, String> paramMap = new HashMap<>();
-
-                    for (JsonElement parameter : paramsArray) {
-                        JsonObject paramObj = parameter.getAsJsonObject();
-                        String paramName = paramObj.get("parameterName").getAsString();
-                        String paramValue = resolvePlaceholder(
-                            paramObj.get("parameterValue").getAsString(),
-                            sharedState
-                        );
-                        paramMap.put(paramName, paramValue);
-                    }
-
-                    logger.info("[planner] ✓ LLM generated single function: {} with {}", fnName, paramMap);
-                    callFunction(fnName, paramMap, sharedState).join();
+                    runPipelineLoop(pipeline, client);
                     return true;
 
                 } else if (jsonObject.has("clarification")) {
@@ -324,7 +308,7 @@ public class FunctionCallerV2 {
         });
     }
 
-    private static class ExecutionRecord {
+    private class ExecutionRecord {
         String timestamp;
         String command;
         List<Double> eventEmbedding;
@@ -354,59 +338,33 @@ public class FunctionCallerV2 {
         }
     }
 
-    private static String getCurrentDateandTime() {
+    private String getCurrentDateandTime() {
         DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss");
         LocalDateTime now = LocalDateTime.now();
         return dtf.format(now);
     }
 
-    private static void getFunctionOutput(String method) {
-        functionOutput = String.valueOf(method);
+    private void getFunctionOutput(String method) {
+        actionState.output = String.valueOf(method);
     }
 
-    private static class Tools {
-        /** goTo tool: path finder + tracer **/
-        private static void goTo(int x, int y, int z, boolean sprint) {
-            System.out.println("Going to coordinates: " + x + ", " + y + ", " + z + " | Sprint: " + sprint);
-            if (botSource == null) {
-                System.out.println("Bot not found.");
-                getFunctionOutput("Bot not found.");
-                return;
-            }
-            try {
-                // ✅ Call the method and wait for result
-                String result = GoTo.goTo(botSource, x, y, z, sprint);
-                // ✅ Ensure we have a valid result for parsing
-                if (result == null || result.trim().isEmpty()) {
-                    // Fallback: get current bot position
-                    ServerPlayer bot = botSource.getPlayer();
-                    if (bot != null) {
-                        BlockPos pos = bot.blockPosition();
-                        result = String.format("Bot position - x: %d y: %d z: %d",
-                                pos.getX(), pos.getY(), pos.getZ());
-                    }
-                }
-                getFunctionOutput(result);
-            } catch (Exception e) {
-                logger.error("Error in goTo: ", e);
-                getFunctionOutput("Failed to navigate to coordinates: " + e.getMessage());
-            }
-        }
+    private final Tools tools = new Tools();
 
+    private class Tools {
         /** chartPathToBlock: final positioning **/
-        private static void chartPathToBlock(int targetX, int targetY, int targetZ, String blockType) {
+        private void chartPathToBlock(int targetX, int targetY, int targetZ, String blockType) {
             System.out.println("Charting path to block at: " + targetX + ", " + targetY + ", " + targetZ + " | BlockType: " + blockType);
             getFunctionOutput(ChartPathToBlock.chart(Objects.requireNonNull(botSource.getPlayer()), new BlockPos(targetX, targetY, targetZ), blockType));
         }
 
         /** faceBlock: look at block **/
-        private static void faceBlock(int targetX, int targetY, int targetZ) {
+        private void faceBlock(int targetX, int targetY, int targetZ) {
             System.out.println("Facing block at: " + targetX + ", " + targetY + ", " + targetZ);
             getFunctionOutput(LookController.faceBlock(Objects.requireNonNull(botSource.getPlayer()), new BlockPos(targetX, targetY, targetZ)));
         }
 
         /** faceEntity: look at entity **/
-        private static void faceEntity(int targetX, int targetY, int targetZ) {
+        private void faceEntity(int targetX, int targetY, int targetZ) {
             System.out.println("Facing entity at: " + targetX + ", " + targetY + ", " + targetZ);
             ServerPlayer bot = Objects.requireNonNull(botSource.getPlayer());
             // Get the world
@@ -430,7 +388,7 @@ public class FunctionCallerV2 {
         }
 
         /** detectBlocks: raycast with block type filter **/
-        private static void detectBlocks(String blockType) {
+        private void detectBlocks(String blockType) {
             System.out.println("Detecting blocks of type: " + blockType);
             if (botSource == null || botSource.getPlayer() == null) {
                 getFunctionOutput("Bot not found.");
@@ -439,21 +397,22 @@ public class FunctionCallerV2 {
             try {
                 BlockPos outputPos = blockDetectionUnit.detectBlocks(
                         Objects.requireNonNull(botSource.getPlayer()), blockType);
+                if (outputPos != null) SearchResultState.publish(sharedState, outputPos.getX(), outputPos.getY(), outputPos.getZ(), blockType);
                 String output;
                 if (outputPos == null) {
-                    output = "Block not found!";
+                    throw new MissingDependencyException("Block not found: " + blockType);
                 } else {
                     output = "Block found at " + outputPos.getX() + " " + outputPos.getY() + " " + outputPos.getZ();
                 }
                 getFunctionOutput(output);
             } catch (Exception e) {
                 logger.error("Error in detectBlocks: ", e);
-                getFunctionOutput("Failed to detect blocks: " + e.getMessage());
+                throw new MissingDependencyException("Failed to detect blocks: " + e.getMessage());
             }
         }
 
         /** turn: change torso facing direction **/
-        private static void turn(String direction) {
+        private void turn(String direction) {
             System.out.println("Turning to: " + direction);
             MinecraftServer server = botSource.getServer();
             String botName = botSource.getTextName();
@@ -462,7 +421,7 @@ public class FunctionCallerV2 {
         }
 
         /** look: change head facing direction **/
-        private static void look(String cardinalDirection) {
+        private void look(String cardinalDirection) {
             System.out.println("Looking at: " + cardinalDirection);
             MinecraftServer server = botSource.getServer();
             String botName = botSource.getTextName();
@@ -471,7 +430,7 @@ public class FunctionCallerV2 {
         }
 
         /** placeBlock: place block at coordinates **/
-        private static void placeBlock(int targetX, int targetY, int targetZ, String blockType) {
+        private void placeBlock(int targetX, int targetY, int targetZ, String blockType) {
             System.out.println("Placing block " + blockType + " at: " + targetX + ", " + targetY + ", " + targetZ);
             if (botSource == null || botSource.getPlayer() == null) {
                 getFunctionOutput("Bot not found.");
@@ -501,25 +460,25 @@ public class FunctionCallerV2 {
         }
 
         /** getOxygenLevel: report air level **/
-        private static void getOxygenLevel() {
+        private void getOxygenLevel() {
             System.out.println("Getting oxygen level...");
             getFunctionOutput("Oxygen Level: " + getPlayerOxygen.getBotOxygenLevel(Objects.requireNonNull(botSource.getPlayer())));
         }
 
         /** getHungerLevel: report hunger **/
-        private static void getHungerLevel() {
+        private void getHungerLevel() {
             System.out.println("Getting hunger level...");
             getFunctionOutput("Hunger Level: " + getPlayerHunger.getBotHungerLevel(Objects.requireNonNull(botSource.getPlayer())));
         }
 
         /** getHealthLevel: report health **/
-        private static void getHealthLevel() {
+        private void getHealthLevel() {
             System.out.println("Getting health level...");
             getFunctionOutput("Remaining hearts: " + getHealth.getBotHealthLevel(Objects.requireNonNull(botSource.getPlayer())));
         }
 
         /** equipArmor: equip the best armor available in inventory **/
-        private static void equipArmor() {
+        private void equipArmor() {
             if (botSource == null || botSource.getPlayer() == null) {
                 getFunctionOutput("Bot not found.");
                 return;
@@ -563,13 +522,13 @@ public class FunctionCallerV2 {
             }
         }
 
-        private static void webSearch(String query) {
+        private void webSearch(String query) {
             System.out.println("Running web search...");
             getFunctionOutput("Web search result: " + WebSearchTool.search(query));
         }
 
         /** searchBlocks: efficiently search for blocks in expanding radius **/
-        private static void searchBlocks(String blockType, int initialRadius, int maxRadius, int radiusIncrement) {
+        private void searchBlocks(String blockType, int initialRadius, int maxRadius, int radiusIncrement) {
             System.out.println("Searching for " + blockType + " in radius " + initialRadius + "-" + maxRadius);
             if (botSource == null || botSource.getPlayer() == null) {
                 getFunctionOutput("Bot not found.");
@@ -601,13 +560,13 @@ public class FunctionCallerV2 {
             }
         }
 
-        private static void sendMessageToChat(String message) {
+        private void sendMessageToChat(String message) {
             System.out.println("Sending message to chat...");
             ChatUtils.sendChatMessages(botSource, message);
         }
     }
 
-    private static String toolBuilder() {
+    private String toolBuilder() {
         var gson = new Gson();
         List<Map<String, Object>> functions = ToolRegistry.TOOLS.stream().map(tool -> Map.of(
                     "name", tool.name(),
@@ -622,7 +581,7 @@ public class FunctionCallerV2 {
     }
 
     // This code right here is pure EUREKA moment.
-    private static String buildPrompt(String toolString) {
+    private String buildPrompt(String toolString) {
         return """
             You are a first-principles reasoning **function-caller AI agent** for a Minecraft bot.
             
@@ -647,7 +606,11 @@ public class FunctionCallerV2 {
             Always match these to the most relevant tools.
             
             4. **Use $placeholders for shared state.** 
-            If a step depends on output from a previous step, use `$lastDetectedBlock.x` (etc.). 
+            If a step depends on output from a previous step, use `$lastDetectedBlock.x` (etc.).
+            searchBlocks and detectBlocks publish these coordinates only on success. Never invent missing coordinates.
+            Use the same action, pipeline, or clarification schema for initial responses and recovery.
+            Search radii must be positive integers no greater than 128.
+            goTo completes only after arrival, and approaches occupied blocks within mining range.
             The runtime will substitute these dynamically.
             
             ---
@@ -665,7 +628,7 @@ public class FunctionCallerV2 {
             ### **Examples**
             
             ✅ **Continue:**
-            If you are satisfied, do nothing — the next step will execute automatically.
+            The executor runs validated steps in sequence. On recovery, always return a complete JSON response.
             
             ✅ **Retry:**
             If the previous function failed or needs adjustments, output:
@@ -718,9 +681,9 @@ public class FunctionCallerV2 {
             If you only need to use one tool, output in this JSON format.
             
             {
-              "functionName": "searchBlock",
+              "functionName": "detectBlocks",
               "parameters": [
-                { "parameterName": "direction", "parameterValue": "front" }
+                { "parameterName": "blockType", "parameterValue": "oak_log" }
               ]
             }
             
@@ -729,9 +692,9 @@ public class FunctionCallerV2 {
             {
               "pipeline": [
                 {
-                  "functionName": "searchBlock",
+                  "functionName": "detectBlocks",
                   "parameters": [
-                    { "parameterName": "direction", "parameterValue": "front" }
+                    { "parameterName": "blockType", "parameterValue": "oak_log" }
                   ]
                 },
                 {
@@ -804,7 +767,7 @@ public class FunctionCallerV2 {
                 """ + functionStateKeyMap + "\n Do remember to add a placeholder symbol: $ in front of each parameter name when designing the pipeline json.";
     }
 
-    private static String generatePromptContext(String userPrompt) {
+    private String generatePromptContext(String userPrompt) {
         String contextOutput = "";
         String sysPrompt = """
         You are a context generation AI agent in terms of minecraft. \n
@@ -859,7 +822,7 @@ public class FunctionCallerV2 {
         return contextOutput;
     }
 
-    public static String buildLLMBotContext(State state, Map<String, Object> sharedState, Map<String, Object> surroundingsSummary) {
+    public String buildLLMBotContext(State state, Map<String, Object> sharedState, Map<String, Object> surroundingsSummary) {
         StringBuilder sb = new StringBuilder();
         sb.append("Bot current state:\n");
         sb.append("- Position: (").append(state.getBotX()).append(", ").append(state.getBotY()).append(", ").append(state.getBotZ()).append(")\n");
@@ -919,9 +882,9 @@ public class FunctionCallerV2 {
         return sb.toString();
     }
 
-    public static void run(String userPrompt) {
+    public void run(String userPrompt) {
         ollamaAPI.setRequestTimeoutSeconds(600);
-        String systemPrompt = FunctionCallerV2.buildPrompt(toolBuilder());
+        String systemPrompt = buildPrompt(toolBuilder());
         String response;
         State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
         InternalMap map = new InternalMap(botSource.getPlayer(), 1, 1); // 1-block radius in all directions
@@ -956,8 +919,8 @@ public class FunctionCallerV2 {
         }
     }
 
-    public static void run(String userPrompt, LLMClient client) {
-        String systemPrompt = FunctionCallerV2.buildPrompt(toolBuilder());
+    public void run(String userPrompt, LLMClient client) {
+        String systemPrompt = buildPrompt(toolBuilder());
         String response;
         State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
         InternalMap map = new InternalMap(botSource.getPlayer(), 1, 1); // 1-block radius in all directions
@@ -986,7 +949,7 @@ public class FunctionCallerV2 {
         }
     }
 
-    private static String extractJson(String response) {
+    private String extractJson(String response) {
         String stripped = stripThinkBlock(response); // Use fix 1 here
         // Try to locate either a JSON object or array
         int objStart = stripped.indexOf("{");
@@ -1007,7 +970,7 @@ public class FunctionCallerV2 {
         return "{}";
     }
 
-    private static boolean isValidJson(String json) {
+    private boolean isValidJson(String json) {
         try {
             JsonParser.parseString(json);
             return true;
@@ -1016,7 +979,7 @@ public class FunctionCallerV2 {
         }
     }
 
-    private static String stripThinkBlock(String response) {
+    private String stripThinkBlock(String response) {
         Matcher matcher = THINK_BLOCK.matcher(response);
         if (matcher.find()) {
             return response.replace(matcher.group(0), "").trim(); // Strip the full <think>...</think>
@@ -1024,98 +987,29 @@ public class FunctionCallerV2 {
         return response.trim();
     }
 
-    private static void executeFunction(String userInput, String response) {
-        String executionDateTime = getCurrentDateandTime();
-        try {
-            executor.submit(() -> {
-                String cleanedResponse = cleanJsonString(response);
-                logger.info("Cleaned JSON Response: {}", cleanedResponse);
-                JsonReader reader = new JsonReader(new StringReader(cleanedResponse));
-                reader.setStrictness(Strictness.LENIENT);
-                JsonObject jsonObject = JsonParser.parseReader(reader).getAsJsonObject();
-                if (jsonObject.has("pipeline")) {
-                    AutoFaceEntity.setBotExecutingTask(true);
-                    JsonArray pipeline = jsonObject.getAsJsonArray("pipeline");
-                    runPipelineLoop(pipeline);
-                } else if (jsonObject.has("functionName")) {
-                    AutoFaceEntity.setBotExecutingTask(true);
-                    String fnName = jsonObject.get("functionName").getAsString();
-                    JsonArray paramsArray = jsonObject.get("parameters").getAsJsonArray();
-                    Map<String, String> paramMap = new ConcurrentHashMap<>();
-                    StringBuilder params = new StringBuilder();
-                    for (JsonElement parameter : paramsArray) {
-                        JsonObject paramObj = parameter.getAsJsonObject();
-                        String paramName = paramObj.get("parameterName").getAsString();
-                        String paramValue = paramObj.get("parameterValue").getAsString();
-                        paramValue = resolvePlaceholder(paramValue, sharedState);
-                        params.append(paramName).append("=").append(paramValue).append(", ");
-                        paramMap.put(paramName, paramValue);
-                    }
-                    logger.info("Executing: {} with {}", fnName, paramMap);
-                    callFunction(fnName, paramMap, sharedState).join();
-                } else if (jsonObject.has("clarification")) {
-                    System.out.println("Detected clarification");
-                    String clarification = jsonObject.get("clarification").getAsString();
-                    // Save the clarification state
-                    ChatContextManager.setPendingClarification(playerUUID, userInput, clarification, botSource.getTextName());
-                    // Relay to player in-game
-                    sendMessageToPlayer(clarification);
-                } else {
-                    throw new IllegalStateException("Response must have either functionName or pipeline.");
-                }
-                // getFunctionResultAndSave(userInput, executionDateTime);
-            });
-        } catch (JsonSyntaxException | NullPointerException | IllegalStateException e) {
-            logger.error("Error processing JSON response: {}", e.getMessage(), e);
-        }
+    private void executeFunction(String userInput, String response) {
+        executeFunction(userInput, response, null);
     }
 
-    private static void executeFunction(String userInput, String response, LLMClient client) {
-        String executionDateTime = getCurrentDateandTime();
-        try {
-            executor.submit(() -> {
-                String cleanedResponse = cleanJsonString(response);
-                logger.info("Cleaned JSON Response: {}", cleanedResponse);
-                JsonReader reader = new JsonReader(new StringReader(cleanedResponse));
-                reader.setStrictness(Strictness.LENIENT);
-                JsonObject jsonObject = JsonParser.parseReader(reader).getAsJsonObject();
-                if (jsonObject.has("pipeline")) {
-                    AutoFaceEntity.setBotExecutingTask(true);
-                    JsonArray pipeline = jsonObject.getAsJsonArray("pipeline");
-                    runPipelineLoop(pipeline, client);
-                } else if (jsonObject.has("functionName")) {
-                    AutoFaceEntity.setBotExecutingTask(true);
-                    String fnName = jsonObject.get("functionName").getAsString();
-                    JsonArray paramsArray = jsonObject.get("parameters").getAsJsonArray();
-                    Map<String, String> paramMap = new ConcurrentHashMap<>();
-                    StringBuilder params = new StringBuilder();
-                    for (JsonElement parameter : paramsArray) {
-                        JsonObject paramObj = parameter.getAsJsonObject();
-                        String paramName = paramObj.get("parameterName").getAsString();
-                        String paramValue = paramObj.get("parameterValue").getAsString();
-                        paramValue = resolvePlaceholder(paramValue, sharedState);
-                        params.append(paramName).append("=").append(paramValue).append(", ");
-                        paramMap.put(paramName, paramValue);
-                    }
-                    logger.info("Executing: {} with {}", fnName, paramMap);
-                    callFunction(fnName, paramMap, sharedState).join();
-                } else if (jsonObject.has("clarification")) {
-                    String clarification = jsonObject.get("clarification").getAsString();
-                    // Save the clarification state
-                    ChatContextManager.setPendingClarification(playerUUID, userInput, clarification, botSource.getTextName());
-                    // Relay to player in-game
-                    sendMessageToPlayer(clarification);
+    private void executeFunction(String userInput, String response, LLMClient client) {
+        executor.submit(() -> {
+            try {
+                JsonObject object = PipelineSchema.normalize(JsonParser.parseString(response));
+                if (object.has("clarification")) {
+                    String question = object.get("clarification").getAsString();
+                    ChatContextManager.setPendingClarification(playerUUID, userInput, question, botSource.getTextName());
+                    sendMessageToPlayer(question);
                 } else {
-                    throw new IllegalStateException("Response must have either functionName or pipeline.");
+                    runPipelineLoop(object.getAsJsonArray("pipeline"), client);
                 }
-                // getFunctionResultAndSave(userInput, executionDateTime);
-            });
-        } catch (JsonSyntaxException | NullPointerException | IllegalStateException e) {
-            logger.error("Error processing JSON response: {}", e.getMessage(), e);
-        }
+            } catch (Exception error) {
+                logger.error("Action execution stopped", error);
+                sendMessageToPlayer("Action stopped: " + error.getMessage());
+            }
+        });
     }
 
-    private static void processLLMOutput(String fullResponse, String botName, CommandSourceStack botSource) {
+    private void processLLMOutput(String fullResponse, String botName, CommandSourceStack botSource) {
         logger.info("processLLMOutput called with response: '{}', botName: '{}'", fullResponse, botName);
         if (fullResponse == null || fullResponse.trim().isEmpty()) {
             logger.warn("fullResponse is null or empty");
@@ -1145,374 +1039,65 @@ public class FunctionCallerV2 {
         }
     }
 
-    private static void sendMessageToPlayer(String message) {
+    private void sendMessageToPlayer(String message) {
         processLLMOutput(message, botSource.getTextName(), botSource);
     }
 
-    private static void runPipelineLoop(JsonArray pipeline) {
-        List<JsonObject> steps = new ArrayList<>();
-        List<String> executedSteps = new ArrayList<>();
-        for (JsonElement step : pipeline) {
-            steps.add(step.getAsJsonObject());
-        }
-
-        Deque<JsonObject> pipelineStack = new ArrayDeque<>(steps); // Keep FIFO order
-        logger.info("Pipeline stack: {}", pipelineStack);
-        OllamaChatRequestBuilder builder = OllamaChatRequestBuilder.getInstance(selectedLM);
-        String systemPrompt = FunctionCallerV2.buildPrompt(toolBuilder());
-        final int maxRetries = 3;
-        int retryCount = 0;
-
-        while (!pipelineStack.isEmpty()) {
-            JsonObject step = pipelineStack.pop();
-            String functionName = step.get("functionName").getAsString();
-            JsonArray parameters = step.getAsJsonArray("parameters");
-            Map<String, String> paramMap = new HashMap<>();
-            for (JsonElement param : parameters) {
-                JsonObject paramObj = param.getAsJsonObject();
-                String paramName = paramObj.get("parameterName").getAsString();
-                String paramValue = resolvePlaceholder(paramObj.get("parameterValue").getAsString(), sharedState);
-                paramMap.put(paramName, paramValue);
-            }
-
-            boolean hasUnresolved = paramMap.values().stream().anyMatch(v -> v.equals("__UNRESOLVED__"));
-            if (hasUnresolved) {
-                logger.warn("⚠️ One or more parameters in step '{}' are unresolved. Triggering LLM fallback.", functionName);
-                if (retryCount >= maxRetries) {
-                    logger.error("❌ Max LLM fallback retries reached due to unresolved parameters. Aborting.");
-                    break;
-                }
-                String newPrompt = "The following steps in the pipeline were successfully executed:\n"
-                        + String.join("\n", executedSteps)
-                        + "\n\nExecution failed at step: " + functionName
-                        + "\nCause: One or more placeholders could not be resolved from shared state.";
-                try {
-                    State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
-                    InternalMap map = new InternalMap(botSource.getPlayer(), 1, 1);
-                    map.updateMap();
-                    // If method returns Map<String, String>
-                    Map<String, String> surroundingsStr = map.summarizeSurroundings();
-                    Map<String, Object> surroundings = new HashMap<>();
-                    surroundings.putAll(surroundingsStr);
-
-                    String botContext = buildLLMBotContext(initialState, sharedState, surroundings);
-                    String fullSystemPrompt = systemPrompt + "\n\nBot's context information:\n" + botContext;
-
-                    List<OllamaChatMessage> messages = new java.util.ArrayList<>();
-                    messages.add(new OllamaChatMessage(OllamaChatMessageRole.SYSTEM, fullSystemPrompt));
-                    messages.add(new OllamaChatMessage(OllamaChatMessageRole.USER, newPrompt));
-
-                    net.shasankp000.OllamaClient.OllamaThinkingResponse thinkingResponse =
-                            net.shasankp000.OllamaClient.OllamaAPIHelper.smartChat(
-                                    ollamaAPI,
-                                    "http://localhost:11434",
-                                    net.shasankp000.AIPlayer.CONFIG.getSelectedLanguageModel(),
-                                    messages
-                            );
-
-                    String llmResponse = thinkingResponse.getContent();
-                    logger.info("Raw LLM response: {}", llmResponse);
-                    String cleanedResponse = stripThinkBlock(llmResponse);
-                    String jsonPart = extractJson(cleanedResponse);
-                    logger.info("Extracted JSON: {}", jsonPart);
-                    JsonObject llmResponseObj = JsonParser.parseString(jsonPart).getAsJsonObject();
-
-                    if (llmResponseObj.has("pipeline")) {
-                        logger.info("LLM provided NEW pipeline. Rebuilding stack.");
-                        retryCount = 0;
-                        JsonArray newPipeline = llmResponseObj.getAsJsonArray("pipeline");
-                        pipelineStack.clear();
-                        List<JsonObject> newSteps = new ArrayList<>();
-                        for (JsonElement e : newPipeline) {
-                            newSteps.add(e.getAsJsonObject());
-                        }
-                        pipelineStack.addAll(newSteps);
-                        continue;
-                    } else if (llmResponseObj.has("clarification")) {
-                        logger.info("LLM requested clarification. Relaying to player.");
-                        String clarification = llmResponseObj.get("clarification").getAsString();
-                        ChatContextManager.setPendingClarification(playerUUID, "A recent action failed.", clarification, botSource.getTextName());
-                        sendMessageToPlayer(clarification);
-                        break;
-                    } else {
-                        logger.warn("LLM did not return a pipeline or clarification. Exiting.");
-                        break;
-                    }
-                } catch (Exception e) {
-                    logger.error("❌ Error in LLM fallback after unresolved parameters: {}", e.getMessage(), e);
-                    retryCount++;
-                    continue;
-                }
-            }
-
-            logger.info("Running function: " + functionName + " with " + paramMap);
-            callFunction(functionName, paramMap, sharedState).join(); // Sync call
-            logger.info("Function output: {}", functionOutput);
-            parseOutputValues(functionName, functionOutput);
-
-            // Short wait for state to settle (e.g., for movement tools)
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                logger.warn("Interrupted during state settle wait");
-            }
-
-            // Get bot entity
-            ServerPlayer bot = botSource.getPlayer();
-            if (bot == null) {
-                logger.error("Bot entity not found for verification");
-                continue;
-            }
-
-            // Use state-based verifier
-            ToolVerifiers.StateVerifier verifier = ToolVerifiers.VERIFIER_REGISTRY.get(functionName);
-            ToolVerifiers.VerificationResult result = (verifier == null)
-                    ? new ToolVerifiers.VerificationResult(true, null)
-                    : verifier.verify(paramMap, sharedState, bot);
-
-            if (result.success) {
-                logger.info("✅ Verifier passed for {} with data: {}", functionName, result.data);
-                executedSteps.add(functionName + ", Output: " + functionOutput);
-            } else {
-                logger.warn("❌ Verifier failed for {} with data: {}", functionName, result.data);
-                if (retryCount >= maxRetries) {
-                    logger.error("❌ Max LLM fallback retries reached due to verifier failures. Aborting.");
-                    break;
-                }
-                String newPrompt = "The following steps were executed successfully:\n"
-                        + String.join("\n", executedSteps)
-                        + "\n\nExecution failed at step: " + functionName
-                        + "\nFunction output: " + functionOutput
-                        + "\nVerification details: " + result.data;
-                try {
-                    State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
-                    InternalMap map = new InternalMap(botSource.getPlayer(), 1, 1);
-                    map.updateMap();
-                    // If method returns Map<String, String>
-                    Map<String, String> surroundingsStr = map.summarizeSurroundings();
-                    Map<String, Object> surroundings = new HashMap<>();
-                    surroundings.putAll(surroundingsStr);
-
-                    String botContext = buildLLMBotContext(initialState, sharedState, surroundings);
-                    String fullSystemPrompt = systemPrompt + "\n\nBot's context information:\n" + botContext;
-                    OllamaChatRequestModel requestModel = builder
-                            .withMessage(OllamaChatMessageRole.SYSTEM, fullSystemPrompt)
-                            .withMessage(OllamaChatMessageRole.USER, newPrompt)
-                            .build();
-                    OllamaChatResult llmResult = ollamaAPI.chat(requestModel);
-                    String llmResponse = llmResult.getResponse();
-                    logger.info("Raw LLM response: {}", llmResponse);
-                    String cleanedResponse = stripThinkBlock(llmResponse);
-                    String jsonPart = extractJson(cleanedResponse);
-                    logger.info("Extracted JSON: {}", jsonPart);
-                    JsonObject llmResponseObj = JsonParser.parseString(jsonPart).getAsJsonObject();
-
-                    if (llmResponseObj.has("pipeline")) {
-                        logger.info("LLM provided NEW pipeline. Rebuilding stack.");
-                        retryCount = 0;
-                        JsonArray newPipeline = llmResponseObj.getAsJsonArray("pipeline");
-                        pipelineStack.clear();
-                        List<JsonObject> newSteps = new ArrayList<>();
-                        for (JsonElement e : newPipeline) {
-                            newSteps.add(e.getAsJsonObject());
-                        }
-                        pipelineStack.addAll(newSteps);
-                    } else if (llmResponseObj.has("clarification")) {
-                        logger.info("LLM requested clarification. Relaying to player.");
-                        String clarification = llmResponseObj.get("clarification").getAsString();
-                        ChatContextManager.setPendingClarification(playerUUID, "A recent action failed.", clarification, botSource.getTextName());
-                        sendMessageToPlayer(clarification);
-                        break;
-                    } else {
-                        logger.warn("LLM did not return a pipeline or clarification. Exiting.");
-                        break;
-                    }
-                } catch (Exception e) {
-                    logger.error("❌ Error in LLM fallback after verifier failure: {}", e.getMessage(), e);
-                    retryCount++;
-                }
-            }
-        }
-        blockDetectionUnit.setIsBlockDetectionActive(false);
-        if (botSource != null && botSource.getPlayer() != null) {
-            NavigationService.cancel(botSource.getServer(), botSource.getPlayer().getUUID(), "Function pipeline reset");
-        }
-        AutoFaceEntity.setBotExecutingTask(false);
-        AutoFaceEntity.isBotMoving = false;
-        logger.info("✔️ Autoface module has been reset.");
+    private void runPipelineLoop(JsonArray pipeline) {
+        runPipelineLoop(pipeline, null);
     }
 
-    // overloaded method to handle the other LLM providers
-    private static void runPipelineLoop(JsonArray pipeline, LLMClient client) {
-        List<JsonObject> steps = new ArrayList<>();
-        List<String> executedSteps = new ArrayList<>();
-        for (JsonElement step : pipeline) {
-            steps.add(step.getAsJsonObject());
-        }
-
-        Deque<JsonObject> pipelineStack = new ArrayDeque<>(steps);
-        logger.info("Pipeline stack: {}", pipelineStack);
-        String systemPrompt = FunctionCallerV2.buildPrompt(toolBuilder());
-        final int maxRetries = 3;
-        int retryCount = 0;
-
-        while (!pipelineStack.isEmpty()) {
-            JsonObject step = pipelineStack.pop();
-            String functionName = step.get("functionName").getAsString();
-            JsonArray parameters = step.getAsJsonArray("parameters");
-            Map<String, String> paramMap = new HashMap<>();
-            for (JsonElement param : parameters) {
-                JsonObject paramObj = param.getAsJsonObject();
-                String paramName = paramObj.get("parameterName").getAsString();
-                String paramValue = resolvePlaceholder(paramObj.get("parameterValue").getAsString(), sharedState);
-                paramMap.put(paramName, paramValue);
-            }
-
-            boolean hasUnresolved = paramMap.values().stream().anyMatch(v -> v.equals("__UNRESOLVED__"));
-            if (hasUnresolved) {
-                logger.warn("⚠️ One or more parameters in step '{}' are unresolved. Triggering LLM fallback.", functionName);
-                if (retryCount >= maxRetries) {
-                    logger.error("❌ Max LLM fallback retries reached due to unresolved parameters. Aborting.");
-                    break;
-                }
-                String newPrompt = "The following steps in the pipeline were successfully executed:\n"
-                        + String.join("\n", executedSteps)
-                        + "\n\nExecution failed at step: " + functionName
-                        + "\nCause: One or more placeholders could not be resolved from shared state.";
+    private void runPipelineLoop(JsonArray pipeline, LLMClient client) {
+        UUID botId = botSource.getPlayer().getUUID();
+        try (ExecutionLease lease = ExecutionLease.acquire(botId)) {
+            actionState.reset();
+            JsonObject envelope = new JsonObject();
+            envelope.add("pipeline", pipeline);
+            Deque<JsonElement> pending = new ArrayDeque<>();
+            PipelineSchema.normalize(envelope).getAsJsonArray("pipeline").forEach(pending::add);
+            while (!pending.isEmpty()) {
+                checkActive();
+                actionState.nextAction();
+                if (Thread.currentThread().isInterrupted()) throw new CancellationException("Execution interrupted");
+                JsonObject step = pending.removeFirst().getAsJsonObject();
+                String name = step.get("functionName").getAsString();
                 try {
-                    State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
-                    InternalMap map = new InternalMap(botSource.getPlayer(), 1, 1);
-                    map.updateMap();
-                    // If method returns Map<String, String>
-                    Map<String, String> surroundingsStr = map.summarizeSurroundings();
-                    Map<String, Object> surroundings = new HashMap<>();
-                    surroundings.putAll(surroundingsStr);
-
-                    String botContext = buildLLMBotContext(initialState, sharedState, surroundings);
-                    String fullSystemPrompt = systemPrompt + "\n\nBot's context information:\n" + botContext;
-
-                    String llmResponse = client.sendPrompt(fullSystemPrompt, newPrompt);
-                    logger.info("Raw LLM response: {}", llmResponse);
-                    String cleanedResponse = stripThinkBlock(llmResponse);
-                    String jsonPart = extractJson(cleanedResponse);
-                    logger.info("Extracted JSON: {}", jsonPart);
-                    JsonObject llmResponseObj = JsonParser.parseString(jsonPart).getAsJsonObject();
-
-                    if (llmResponseObj.has("pipeline")) {
-                        logger.info("LLM provided NEW pipeline. Rebuilding stack.");
-                        retryCount = 0;
-                        JsonArray newPipeline = llmResponseObj.getAsJsonArray("pipeline");
-                        pipelineStack.clear();
-                        List<JsonObject> newSteps = new ArrayList<>();
-                        for (JsonElement e : newPipeline) {
-                            newSteps.add(e.getAsJsonObject());
-                        }
-                        pipelineStack.addAll(newSteps);
-                        continue;
-                    } else if (llmResponseObj.has("clarification")) {
-                        logger.info("LLM requested clarification. Relaying to player.");
-                        String clarification = llmResponseObj.get("clarification").getAsString();
-                        ChatContextManager.setPendingClarification(playerUUID, "A recent action failed.", clarification, botSource.getTextName());
-                        sendMessageToPlayer(clarification);
-                        break;
-                    } else {
-                        logger.warn("LLM did not return a pipeline or clarification. Exiting.");
-                        break;
+                    Map<String, String> params = PipelineSchema.resolve(step, sharedState);
+                    callFunction(name, params, sharedState).join();
+                    checkActive();
+                    parseOutputValues(name, actionState.output);
+                    ToolVerifiers.StateVerifier verifier = ToolVerifiers.VERIFIER_REGISTRY.get(name);
+                    if (verifier != null && !verifier.verify(params, sharedState, botSource.getPlayer()).success)
+                        throw new IllegalStateException(name + " verification failed: " + actionState.output);
+                } catch (Exception error) {
+                    Throwable cause = error;
+                    while (cause.getCause() != null) cause = cause.getCause();
+                    if (cause instanceof CancellationException) throw (CancellationException) cause;
+                    if (cause instanceof MissingDependencyException) throw (MissingDependencyException) cause;
+                    checkActive();
+                    actionState.correction();
+                    String prompt = "Action " + name + " failed: " + cause.getMessage()
+                            + "\nState: " + sharedState + "\nReturn a corrected pipeline or clarification. Do not assume missing coordinates.";
+                    String response;
+                    if (client != null) response = client.sendPrompt(buildPrompt(toolBuilder()), prompt);
+                    else {
+                        OllamaChatRequestModel request = OllamaChatRequestBuilder.getInstance(selectedLM)
+                                .withMessage(OllamaChatMessageRole.SYSTEM, buildPrompt(toolBuilder()))
+                                .withMessage(OllamaChatMessageRole.USER, prompt).build();
+                        try { response = ollamaAPI.chat(request).getResponse(); }
+                        catch (Exception failure) { throw new IllegalStateException("Recovery provider failed", failure); }
                     }
-                } catch (Exception e) {
-                    logger.error("❌ Error in LLM fallback after unresolved parameters: {}", e.getMessage(), e);
-                    retryCount++;
-                    continue;
-                }
-            }
-
-            logger.info("Running function: {} with {}", functionName, paramMap);
-            callFunction(functionName, paramMap, sharedState).join();
-            logger.info("Function output: {}", functionOutput);
-            parseOutputValues(functionName, functionOutput);
-
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                logger.warn("Interrupted during state settle wait");
-            }
-
-            ServerPlayer bot = botSource.getPlayer();
-            if (bot == null) {
-                logger.error("Bot entity not found for verification");
-                continue;
-            }
-
-            ToolVerifiers.StateVerifier verifier = ToolVerifiers.VERIFIER_REGISTRY.get(functionName);
-            ToolVerifiers.VerificationResult result = (verifier == null)
-                    ? new ToolVerifiers.VerificationResult(true, null)
-                    : verifier.verify(paramMap, sharedState, bot);
-
-            if (result.success) {
-                logger.info("✅ Verifier passed for {} with data: {}", functionName, result.data);
-                executedSteps.add(functionName + ", Output: " + functionOutput);
-            } else {
-                logger.warn("❌ Verifier failed for {} with data: {}", functionName, result.data);
-                if (retryCount >= maxRetries) {
-                    logger.error("❌ Max LLM fallback retries reached due to verifier failures. Aborting.");
-                    break;
-                }
-                String newPrompt = "The following steps were executed successfully:\n"
-                        + String.join("\n", executedSteps)
-                        + "\n\nExecution failed at step: " + functionName
-                        + "\nFunction output: " + functionOutput
-                        + "\nVerification details: " + result.data;
-                try {
-                    State initialState = BotEventHandler.createInitialState(botSource.getPlayer());
-                    InternalMap map = new InternalMap(botSource.getPlayer(), 1, 1);
-                    map.updateMap();
-                    Map<String, String> surroundingsStr = map.summarizeSurroundings();
-                    Map<String, Object> surroundings = new HashMap<>();
-                    surroundings.putAll(surroundingsStr);
-
-                    String botContext = buildLLMBotContext(initialState, sharedState, surroundings);
-                    String fullSystemPrompt = systemPrompt + "\n\nBot's context information:\n" + botContext;
-
-                    String llmResponse = client.sendPrompt(fullSystemPrompt, newPrompt);
-                    logger.info("Raw LLM response: {}", llmResponse);
-                    String cleanedResponse = stripThinkBlock(llmResponse);
-                    String jsonPart = extractJson(cleanedResponse);
-                    logger.info("Extracted JSON: {}", jsonPart);
-                    JsonObject llmResponseObj = JsonParser.parseString(jsonPart).getAsJsonObject();
-
-                    if (llmResponseObj.has("pipeline")) {
-                        logger.info("LLM provided NEW pipeline. Rebuilding stack.");
-                        retryCount = 0;
-                        JsonArray newPipeline = llmResponseObj.getAsJsonArray("pipeline");
-                        pipelineStack.clear();
-                        List<JsonObject> newSteps = new ArrayList<>();
-                        for (JsonElement e : newPipeline) {
-                            newSteps.add(e.getAsJsonObject());
-                        }
-                        pipelineStack.addAll(newSteps);
-                    } else if (llmResponseObj.has("clarification")) {
-                        logger.info("LLM requested clarification. Relaying to player.");
-                        String clarification = llmResponseObj.get("clarification").getAsString();
-                        ChatContextManager.setPendingClarification(playerUUID, "A recent action failed.", clarification, botSource.getTextName());
-                        sendMessageToPlayer(clarification);
-                        break;
-                    } else {
-                        logger.warn("LLM did not return a pipeline or clarification. Exiting.");
-                        break;
+                    // Validate the entire replacement before changing the executable queue.
+                    JsonObject replacement = PipelineSchema.normalize(JsonParser.parseString(extractJson(response)));
+                    pending.clear();
+                    if (replacement.has("clarification")) {
+                        sendMessageToPlayer(replacement.get("clarification").getAsString());
+                        return;
                     }
-                } catch (Exception e) {
-                    logger.error("❌ Error in LLM fallback after verifier failure: {}", e.getMessage(), e);
-                    retryCount++;
+                    replacement.getAsJsonArray("pipeline").forEach(pending::add);
                 }
             }
         }
-        blockDetectionUnit.setIsBlockDetectionActive(false);
-        if (botSource != null && botSource.getPlayer() != null) {
-            NavigationService.cancel(botSource.getServer(), botSource.getPlayer().getUUID(), "Function pipeline reset");
-        }
-        AutoFaceEntity.setBotExecutingTask(false);
-        AutoFaceEntity.isBotMoving = false;
-        logger.info("✔️ Autoface module has been reset.");
     }
 
     private static final Map<String, List<String>> functionStateKeyMap = Map.ofEntries(
@@ -1529,7 +1114,8 @@ public class FunctionCallerV2 {
             Map.entry("getHealthLevel", List.of("healthLevel"))
     );
 
-    private static void parseOutputValues(String functionName, String output) {
+    private void parseOutputValues(String functionName, String output) {
+        if (functionName.equals("searchBlocks") || functionName.equals("detectBlocks") || functionName.equals("mineBlock")) return;
         List<String> keys = functionStateKeyMap.get(functionName);
         if (keys == null || keys.isEmpty()) return;
 
@@ -1614,79 +1200,55 @@ public class FunctionCallerV2 {
         }
     }
 
-    private static void getFunctionResultAndSave(String userInput, String executionDateTime) {
-        try {
-            // Generate context synchronously
-            String eventContext = generatePromptContext(userInput);
-            // Get embedding client
-            net.shasankp000.ServiceLLMClients.EmbeddingClient embeddingClient =
-                    net.shasankp000.FilingSystem.EmbeddingClientFactory.createClient();
-            // Generate event embedding synchronously
-            List<Double> eventEmbedding;
-            List<Double> eventContextEmbedding;
-            try {
-                eventEmbedding = embeddingClient.generateEmbedding(userInput);
-                // Generate event context embedding synchronously
-                eventContextEmbedding = embeddingClient.generateEmbedding(eventContext);
-            } catch (Exception e) {
-                logger.error("Failed to generate embeddings", e);
-                throw new RuntimeException(e);
-            }
-            // Wait until functionOutput is a valid string
-            while (functionOutput == null || !(functionOutput instanceof String)) {
-                try {
-                    Thread.sleep(500L); // Check every 500ms
-                } catch (InterruptedException e) {
-                    logger.error("Couldn't get function call output");
-                    throw new RuntimeException(e);
-                }
-            }
-            System.out.println("Received output: " + functionOutput);
-            // Generate result embedding based on the function output
-            List<Double> resultEmbedding;
-            try {
-                resultEmbedding = embeddingClient.generateEmbedding(functionOutput);
-            } catch (Exception e) {
-                logger.error("Failed to generate result embedding", e);
-                throw new RuntimeException(e);
-            }
-            // Create execution record and save it
-            ExecutionRecord executionRecord = new ExecutionRecord(executionDateTime, userInput, eventContext, functionOutput, eventEmbedding, eventContextEmbedding, resultEmbedding);
-            executionRecord.updateRecords();
-            // Clear the functionOutput to reset state
-            functionOutput = null;
-            System.out.println("Event data saved successfully.");
-        } catch (Exception e) {
-            // Log or handle the exception
-            logger.error("Error occurred while processing the function result: ", e);
-            throw new RuntimeException(e);
-        }
+    private String resolvePlaceholder(String value, Map<String, Object> state) {
+        return PipelineSchema.resolveValue(value, state);
     }
 
-    private static String resolvePlaceholder(String value, Map<String, Object> state) {
-        if (value == null) return "0";
-        if (value.startsWith("$")) {
-            String key = value.substring(1);
-            Object resolvedObj = SharedStateUtils.getValue(state, key);
-            if (resolvedObj == null) {
-                logger.warn("⚠️ Placeholder '{}' not found in sharedState. Using fallback value '0'", key);
-                return "0";
-            }
-            String resolved = resolvedObj.toString();
-            logger.debug("🔁 Resolved placeholder {} → {}", key, resolved);
-            return resolved;
-        }
-        return value;
-    }
-
-    private static void updateState(List<String> keys, List<Object> values, Map<String, Object> state) {
+    private void updateState(List<String> keys, List<Object> values, Map<String, Object> state) {
         for (int i = 0; i < keys.size(); i++) {
             SharedStateUtils.setValue(state, keys.get(i), values.get(i));
             logger.info("📌 Updated sharedState: {} → {}", keys.get(i), values.get(i));
         }
     }
 
-    private static CompletableFuture<Void> callFunction(String functionName, Map<String, String> paramMap, Map<String, Object> state) {
+    private void checkActive() {
+        if (Thread.currentThread().isInterrupted() || NavigationService.cancellationVersion(botSource.getPlayer().getUUID()) != cancellationVersion)
+            throw new CancellationException("Action request was cancelled");
+    }
+
+    private CompletableFuture<Void> callFunction(String functionName, Map<String, String> paramMap, Map<String, Object> state) {
+        checkActive();
+        actionState.beginAction();
+        functionStateKeyMap.getOrDefault(functionName, List.of()).forEach(state::remove);
+        if (functionName.equals("searchBlocks") || functionName.equals("detectBlocks"))
+            SearchResultState.clear(state);
+        if (functionName.equals("mineBlock")) state.remove("lastMineStatus");
+        if (functionName.equals("goTo")) {
+            state.remove("navigation.reached");
+            return CompletableFuture.runAsync(() -> {
+                BlockPos target = new BlockPos(Integer.parseInt(resolvePlaceholder(paramMap.get("x"), state)),
+                        Integer.parseInt(resolvePlaceholder(paramMap.get("y"), state)),
+                        Integer.parseInt(resolvePlaceholder(paramMap.get("z"), state)));
+                var future = NavigationService.navigate(botSource.getPlayer(), target,
+                        net.shasankp000.PathFinding.NavigationOptions.of(Boolean.parseBoolean(paramMap.get("sprint"))), cancellationVersion);
+                try {
+                    var result = future.get(5, TimeUnit.MINUTES);
+                    if (result.status() == net.shasankp000.PathFinding.NavigationResult.Status.CANCELLED)
+                        throw new CancellationException(result.message());
+                    if (!result.reached()) throw new IllegalStateException(result.message());
+                    state.put("navigation.reached", true);
+                    getFunctionOutput("Bot moved to position - x: " + result.finalPosition().getX()
+                            + " y: " + result.finalPosition().getY() + " z: " + result.finalPosition().getZ());
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new CancellationException("Navigation interrupted");
+                } catch (ExecutionException | TimeoutException error) {
+                    throw new CompletionException(error);
+                } finally {
+                    if (!future.isDone()) future.cancel(false);
+                }
+            });
+        }
         if ("mineBlock".equals(functionName)) {
             try {
                 int targetX = Integer.parseInt(resolvePlaceholder(paramMap.get("targetX"), state));
@@ -1698,71 +1260,63 @@ public class FunctionCallerV2 {
                     getFunctionOutput("⚠️ Failed to mine block: Bot not found");
                     return CompletableFuture.completedFuture(null);
                 }
-                return MiningTool.mineBlock(botSource.getPlayer(), new BlockPos(targetX, targetY, targetZ))
-                        .handle((result, error) -> {
-                            if (error != null) {
-                                logger.error("Mining failed", error);
-                                getFunctionOutput("⚠️ Failed to mine block: " + error.getMessage());
-                            } else {
-                                getFunctionOutput(result.functionMessage());
-                            }
-                            return null;
+                return MiningTool.mineBlock(botSource.getPlayer(), new BlockPos(targetX, targetY, targetZ),
+                                () -> NavigationService.cancellationVersion(botSource.getPlayer().getUUID()) == cancellationVersion)
+                        .thenAccept(result -> {
+                            checkActive();
+                            getFunctionOutput(result.functionMessage());
+                            if (result.status() == MiningResult.Status.CANCELLED) throw new CancellationException(result.message());
+                            if (!result.succeeded()) throw new IllegalStateException(result.message());
+                            state.put("lastMineStatus", "success");
                         });
             } catch (Exception e) {
                 logger.error("Could not start mining", e);
                 getFunctionOutput("⚠️ Failed to mine block: " + e.getMessage());
-                return CompletableFuture.completedFuture(null);
+                return CompletableFuture.failedFuture(e);
             }
         }
 
         return CompletableFuture.runAsync(() -> {
+            checkActive();
             logger.info("🔧 callFunction: {} with params: {}", functionName, paramMap);
 
             switch (functionName) {
-                case "goTo" -> {
-                    int x = Integer.parseInt(resolvePlaceholder(paramMap.get("x"), state));
-                    int y = Integer.parseInt(resolvePlaceholder(paramMap.get("y"), state));
-                    int z = Integer.parseInt(resolvePlaceholder(paramMap.get("z"), state));
-                    boolean sprint = Boolean.parseBoolean(resolvePlaceholder(paramMap.get("sprint"), state));
-                    logger.info("Calling method: goTo with x={} y={} z={} sprint={}", x, y, z, sprint);
-                    Tools.goTo(x, y, z, sprint);
-                }
                 case "chartPathToBlock" -> {
                     int targetX = Integer.parseInt(resolvePlaceholder(paramMap.get("targetX"), state));
                     int targetY = Integer.parseInt(resolvePlaceholder(paramMap.get("targetY"), state));
                     int targetZ = Integer.parseInt(resolvePlaceholder(paramMap.get("targetZ"), state));
                     String blockType = resolvePlaceholder(paramMap.get("blockType"), state);
                     logger.info("Calling method: chartPathToBlock with targetX={} targetY={} targetZ={} blockType={}", targetX, targetY, targetZ, blockType);
-                    Tools.chartPathToBlock(targetX, targetY, targetZ, blockType);
+                    tools.chartPathToBlock(targetX, targetY, targetZ, blockType);
                 }
                 case "faceBlock" -> {
                     int targetX = Integer.parseInt(resolvePlaceholder(paramMap.get("targetX"), state));
                     int targetY = Integer.parseInt(resolvePlaceholder(paramMap.get("targetY"), state));
                     int targetZ = Integer.parseInt(resolvePlaceholder(paramMap.get("targetZ"), state));
                     logger.info("Calling method: faceBlock with targetX={} targetY={} targetZ={}", targetX, targetY, targetZ);
-                    Tools.faceBlock(targetX, targetY, targetZ);
+                    tools.faceBlock(targetX, targetY, targetZ);
                 }
                 case "faceEntity" -> {
                     int targetX = Integer.parseInt(resolvePlaceholder(paramMap.get("targetX"), state));
                     int targetY = Integer.parseInt(resolvePlaceholder(paramMap.get("targetY"), state));
                     int targetZ = Integer.parseInt(resolvePlaceholder(paramMap.get("targetZ"), state));
                     logger.info("Calling method: faceEntity with targetX={} targetY={} targetZ={}", targetX, targetY, targetZ);
-                    Tools.faceEntity(targetX, targetY, targetZ);
+                    tools.faceEntity(targetX, targetY, targetZ);
                 }
                 case "detectBlocks" -> {
                     String blockType = resolvePlaceholder(paramMap.get("blockType"), state);
                     logger.info("Calling method: detectBlocks with blockType={}", blockType);
-                    Tools.detectBlocks(blockType);
+                    tools.detectBlocks(blockType);
                 }
                 case "turn" -> {
                     String direction = resolvePlaceholder(paramMap.get("direction"), state);
                     logger.info("Calling method: turn with direction={}", direction);
-                    Tools.turn(direction);
+                    tools.turn(direction);
                 }
                 case "look" -> {
                     String cardinalDirection = resolvePlaceholder(paramMap.get("cardinalDirection"), state);
                     logger.info("Calling method: look with cardinal direction={}", cardinalDirection);
-                    Tools.look(cardinalDirection);
+                    tools.look(cardinalDirection);
                 }
                 case "placeBlock" -> {
                     int targetX = Integer.parseInt(resolvePlaceholder(paramMap.get("targetX"), state));
@@ -1771,23 +1325,23 @@ public class FunctionCallerV2 {
                     String blockType = resolvePlaceholder(paramMap.get("blockType"), state);
                     logger.info("Calling method: placeBlock with targetX={} targetY={} targetZ={} blockType={}",
                             targetX, targetY, targetZ, blockType);
-                    Tools.placeBlock(targetX, targetY, targetZ, blockType);
+                    tools.placeBlock(targetX, targetY, targetZ, blockType);
                 }
                 case "getOxygenLevel" -> {
                     logger.info("Calling method: getOxygenLevel");
-                    Tools.getOxygenLevel();
+                    tools.getOxygenLevel();
                 }
                 case "getHungerLevel" -> {
                     logger.info("Calling method: getHungerLevel");
-                    Tools.getHungerLevel();
+                    tools.getHungerLevel();
                 }
                 case "getHealthLevel" -> {
                     logger.info("Calling method: getHealthLevel");
-                    Tools.getHealthLevel();
+                    tools.getHealthLevel();
                 }
                 case "equipArmor" -> {
                     logger.info("Calling method: equipArmor");
-                    Tools.equipArmor();
+                    tools.equipArmor();
                 }
                 case "updateState" -> {
                     String keysRaw = paramMap.get("keys");
@@ -1813,7 +1367,7 @@ public class FunctionCallerV2 {
                 case "webSearch" -> {
                     String query = resolvePlaceholder(paramMap.get("query"), state);
                     logger.info("Calling method: webSearch with query='{}'", query);
-                    Tools.webSearch(query);
+                    tools.webSearch(query);
                 }
                 case "searchBlocks" -> {
                     String blockType = resolvePlaceholder(paramMap.get("blockType"), state);
@@ -1823,34 +1377,18 @@ public class FunctionCallerV2 {
                     logger.info("Calling method: searchBlocks with blockType={} initialRadius={} maxRadius={} increment={}",
                             blockType, initialRadius, maxRadius, radiusIncrement);
 
-                    // Call searchBlocks and capture the result
-                    if (botSource != null && botSource.getPlayer() != null) {
-                        ServerPlayer bot = botSource.getPlayer();
-                        BlockPos result = net.shasankp000.Tools.SearchBlocks.searchBlock(
-                            bot,
-                            blockType,
-                            initialRadius,
-                            maxRadius,
-                            radiusIncrement
-                        );
-
-                        // Store result in SharedState for next steps
-                        if (result != null) {
-                            SharedStateUtils.setValue(state, "found_block_x", result.getX());
-                            SharedStateUtils.setValue(state, "found_block_y", result.getY());
-                            SharedStateUtils.setValue(state, "found_block_z", result.getZ());
-                            SharedStateUtils.setValue(state, "found_block_type", blockType);
-                            SharedStateUtils.setValue(state, "search_success", true);
-                            logger.info("✓ searchBlocks found {} at ({}, {}, {})", blockType, result.getX(), result.getY(), result.getZ());
-                        } else {
-                            SharedStateUtils.setValue(state, "search_success", false);
-                            logger.warn("searchBlocks did not find {} within radius {}", blockType, maxRadius);
-                        }
-                    } else {
-                        logger.error("Cannot execute searchBlocks: bot is null");
+                    SearchResultState.clear(state);
+                    BlockPos result = net.shasankp000.Tools.SearchBlocks.searchBlock(
+                            Objects.requireNonNull(botSource.getPlayer()), blockType, initialRadius, maxRadius, radiusIncrement);
+                    if (result == null) {
+                        getFunctionOutput("No " + blockType + " found within " + maxRadius + " blocks");
+                        throw new MissingDependencyException(actionState.output);
                     }
+                    SearchResultState.publish(state, result.getX(), result.getY(), result.getZ(), blockType);
+                    getFunctionOutput("Found " + blockType + " at " + result);
+
                 }
-                default -> logger.warn("Unknown function: {}", functionName);
+                default -> throw new IllegalArgumentException("Unknown function: " + functionName);
             }
 
             logger.info("✓ Function {} execution completed", functionName);
@@ -1861,7 +1399,17 @@ public class FunctionCallerV2 {
      * Execute a Plan generated by the Planner.
      * Converts planned steps into sequential function calls.
      */
-    public static CompletableFuture<Boolean> executePlan(Plan plan, ActionLogWriter logWriter, State initialState) {
+    public CompletableFuture<Boolean> executePlan(Plan plan, ActionLogWriter logWriter, State initialState) {
+        ExecutionLease lease = ExecutionLease.acquire(botSource.getPlayer().getUUID());
+        try {
+            return executePlanOwned(plan, logWriter, initialState).whenComplete((result, error) -> lease.close());
+        } catch (Exception error) {
+            lease.close();
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    private CompletableFuture<Boolean> executePlanOwned(Plan plan, ActionLogWriter logWriter, State initialState) {
         if (plan == null || plan.isEmpty()) {
             logger.warn("Cannot execute empty plan");
             return CompletableFuture.completedFuture(false);
@@ -1876,7 +1424,7 @@ public class FunctionCallerV2 {
         logger.info("Plan has {} steps with total score: {}", plan.length(), plan.getTotalScore());
 
         // Create SharedState for inter-step communication
-        Map<String, Object> sharedState = new java.util.concurrent.ConcurrentHashMap<>();
+        actionState.reset();
 
         // Debug: Log all step names
         for (int i = 0; i < plan.steps.size(); i++) {
@@ -1941,9 +1489,7 @@ public class FunctionCallerV2 {
                             logger.warn("⚠ Step {}/{}: {} completed but verification failed",
                                        stepIndex + 1, plan.steps.size(), step.actionName);
                             // If verification fails for critical action, abort
-                            if (isCriticalAction(step.actionName)) {
-                                throw new RuntimeException("Critical action verification failed: " + step.actionName);
-                            }
+                            throw new IllegalStateException("Action verification failed: " + step.actionName);
                         }
 
                         return (Void) null;
@@ -1965,13 +1511,7 @@ public class FunctionCallerV2 {
                         logger.error("✗ Step {}/{}: {} failed: {}",
                                     stepIndex + 1, plan.steps.size(), step.actionName, ex.getMessage());
 
-                        // For critical actions, throw to abort plan
-                        if (isCriticalAction(step.actionName)) {
-                            logger.error("✗ Critical action failed, aborting plan");
-                            throw new RuntimeException("Critical action failed: " + step.actionName);
-                        }
-
-                        return null;
+                        throw new CompletionException(ex);
                     });
             });
         }
@@ -1990,7 +1530,7 @@ public class FunctionCallerV2 {
     /**
      * Convert a PlannedStep to parameter map for function calling WITH SharedState resolution.
      */
-    private static Map<String, String> convertStepToParams(PlannedStep step, Map<String, Object> state) {
+    private Map<String, String> convertStepToParams(PlannedStep step, Map<String, Object> state) {
         Map<String, String> params = new HashMap<>();
 
         // Map action to parameters based on action name
@@ -2028,12 +1568,12 @@ public class FunctionCallerV2 {
                     int blockY = (int) SharedStateUtils.getValue(state, "found_block_y");
                     int blockZ = (int) SharedStateUtils.getValue(state, "found_block_z");
 
-                    // Navigate to adjacent position (not ON the block)
-                    params.put("x", String.valueOf(blockX + 1));
+                    // The navigation service selects a reachable approach to occupied blocks.
+                    params.put("x", String.valueOf(blockX));
                     params.put("y", String.valueOf(blockY));
                     params.put("z", String.valueOf(blockZ));
                     params.put("sprint", "true");
-                    logger.info("🔗 Resolved goTo params from SharedState: ({}, {}, {})", blockX+1, blockY, blockZ);
+                    logger.info("🔗 Resolved goTo params from SharedState: ({}, {}, {})", blockX, blockY, blockZ);
                 } else if (paramArray.length >= 3) {
                     params.put("x", paramArray[0]);
                     params.put("y", paramArray[1]);
@@ -2124,7 +1664,7 @@ public class FunctionCallerV2 {
     /**
      * Verify that a step achieved its expected outcome based on SharedState changes.
      */
-    private static boolean verifyStepOutcome(PlannedStep step, Map<String, Object> sharedState) {
+    private boolean verifyStepOutcome(PlannedStep step, Map<String, Object> sharedState) {
         String actionName = step.actionName.toLowerCase();
 
         switch (actionName) {
@@ -2141,26 +1681,7 @@ public class FunctionCallerV2 {
 
             case "goto":
             case "movetocoordinates":
-                // Verify goTo moved the bot close to the target
-                Integer targetX = (Integer) SharedStateUtils.getValue(sharedState, "found_block_x");
-                Integer targetZ = (Integer) SharedStateUtils.getValue(sharedState, "found_block_z");
-
-                if (targetX != null && targetZ != null && botSource != null && botSource.getPlayer() != null) {
-                    BlockPos botPos = botSource.getPlayer().blockPosition();
-                    double distance = Math.sqrt(Math.pow(botPos.getX() - (targetX + 1), 2) +
-                                               Math.pow(botPos.getZ() - targetZ, 2));
-
-                    if (distance <= 3.0) { // Within 3 blocks is good enough
-                        logger.info("✓ goTo verification: bot within {} blocks of target", String.format("%.1f", distance));
-                        return true;
-                    } else {
-                        logger.warn("✗ goTo verification failed: bot still {} blocks away from target", String.format("%.1f", distance));
-                        return false;
-                    }
-                }
-                // If no target in state, assume success (might be standalone goTo)
-                logger.info("✓ goTo verification: no target in SharedState, assuming success");
-                return true;
+                return Boolean.TRUE.equals(sharedState.get("navigation.reached"));
 
             case "mineblock":
             case "breakblock":
@@ -2205,7 +1726,7 @@ public class FunctionCallerV2 {
     /**
      * Convert a PlannedStep to parameter map for function calling (legacy method without SharedState).
      */
-    private static Map<String, String> convertStepToParams(PlannedStep step) {
+    private Map<String, String> convertStepToParams(PlannedStep step) {
         Map<String, String> params = new HashMap<>();
 
         // Map action to parameters based on action name
@@ -2334,7 +1855,7 @@ public class FunctionCallerV2 {
      * Determine if an action is critical (plan should abort if it fails).
      * Critical actions are those that subsequent steps depend on.
      */
-    private static boolean isCriticalAction(String actionName) {
+    private boolean isCriticalAction(String actionName) {
         if (actionName == null) return false;
 
         return switch (actionName.toLowerCase()) {

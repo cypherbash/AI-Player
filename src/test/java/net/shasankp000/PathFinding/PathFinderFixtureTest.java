@@ -171,4 +171,30 @@ class PathFinderFixtureTest {
         assertEquals(GoalDisposition.HORIZON_FRONTIER, search.disposition());
         assertTrue(search.effectiveGoal().x <= 12.5);
     }
+
+    @Test void tallLogIsApproachedFromReachableGroundInsteadOfStandingInsideIt() {
+        InMemoryNavigationWorld world = new InMemoryNavigationWorld().floor(-2, 10, 69, -3, 3);
+        for (int y = 70; y <= 76; y++) world.solid(7, y, 0);
+        BlockPos log = new BlockPos(7, 70, 0);
+        PathFinder.Search search = finish(world, new Vec3(0.5, 70, 0.5), log, 64);
+        assertEquals(PathFinder.SearchStatus.FOUND, search.advance(1));
+        assertTrue(search.effectiveGoal().distanceTo(Vec3.atCenterOf(log)) <= 2.5);
+        assertEquals(70, search.effectiveGoal().y, 0.01);
+        assertNotEquals(log, BlockPos.containing(search.effectiveGoal()));
+        assertTrue(PathFinder.approachVisible(world, search.effectiveGoal(), log));
+    }
+
+    @Test void solidUndergroundGoalCannotProduceAnUndergroundRoute() {
+        InMemoryNavigationWorld world = new InMemoryNavigationWorld();
+        for (int y = 60; y <= 69; y++) world.floor(-5, 12, y, -5, 5);
+        PathFinder.Search search = finish(world, new Vec3(0.5, 70, 0.5), new BlockPos(7, 64, 0), 64);
+        assertNotEquals(PathFinder.SearchStatus.FOUND, search.advance(1));
+        assertTrue(search.result().isEmpty());
+    }
+
+    @Test void approachMustNotMineThroughInterveningSolidTerrain() {
+        InMemoryNavigationWorld world = new InMemoryNavigationWorld().floor(-2, 5, 69, -2, 2)
+                .solid(1, 70, 0).solid(1, 71, 0).solid(2, 70, 0);
+        assertFalse(PathFinder.approachVisible(world, new Vec3(0.5, 70, 0.5), new BlockPos(2, 70, 0)));
+    }
 }

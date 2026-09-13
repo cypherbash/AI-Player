@@ -220,8 +220,8 @@ public class LLMServiceHandler {
                 BOT_TASK_POOL.submit(() -> {
                     Thread.currentThread().setName("LLM-Function-Caller-Worker");
                     LOGGER.info("🧵 Started FunctionCallerV2 worker thread");
-                    new FunctionCallerV2(botSource, playerUUID);
-                    FunctionCallerV2.run(message, client);
+                    FunctionCallerV2 functionCaller = new FunctionCallerV2(botSource, playerUUID);
+                    functionCaller.run(message, client);
                     LOGGER.info("✅ Finished FunctionCallerV2 worker thread");
                 });
             }
@@ -245,8 +245,8 @@ public class LLMServiceHandler {
                     BOT_TASK_POOL.submit(() -> {
                         Thread.currentThread().setName("LLM-Function-Caller-Retry-Worker");
                         LOGGER.info("🧵 Started FunctionCallerV2 retry worker thread");
-                        new FunctionCallerV2(botSource, playerUUID);
-                        FunctionCallerV2.run(message, client);
+                        FunctionCallerV2 functionCaller = new FunctionCallerV2(botSource, playerUUID);
+                        functionCaller.run(message, client);
                         LOGGER.info("✅ Finished FunctionCallerV2 retry worker thread");
                     });
                 } else {

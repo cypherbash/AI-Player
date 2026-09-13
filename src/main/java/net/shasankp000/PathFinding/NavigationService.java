@@ -38,6 +38,8 @@ public final class NavigationService {
     private static final long PLANNING_TIME_BUDGET_NANOS = 2_000_000L;
     private static final Map<UUID, EnumSet<SuspensionReason>> SUSPENSIONS = new HashMap<>();
     private static final Set<UUID> PARTICLE_DEBUG = ConcurrentHashMap.newKeySet();
+    private static final NavigationCancellation CANCELLATION = new NavigationCancellation();
+    public static long cancellationVersion(UUID botId) { return CANCELLATION.version(botId); }
     private static int planningCursor;
     private static int lastGlobalPlanningBudget;
 
@@ -51,12 +53,30 @@ public final class NavigationService {
 
     public static CompletableFuture<NavigationResult> navigate(ServerPlayer player, BlockPos goal,
                                                                NavigationOptions options) {
+        return navigate(player, goal, options, cancellationVersion(player.getUUID()));
+    }
+
+    public static CompletableFuture<NavigationResult> navigate(ServerPlayer player, BlockPos goal,
+                                                               NavigationOptions options, long version) {
         Objects.requireNonNull(player, "player");
         Objects.requireNonNull(goal, "goal");
         Objects.requireNonNull(options, "options");
         MinecraftServer server = player.level().getServer();
         CompletableFuture<NavigationResult> future = new CompletableFuture<>();
-        Runnable begin = () -> beginOnServer(player, goal.immutable(), options, future);
+        Runnable begin = () -> {
+            if (!CANCELLATION.isCurrent(player.getUUID(), version) || future.isDone()) {
+                future.complete(new NavigationResult(NavigationResult.Status.CANCELLED, player.blockPosition(), "Request cancelled before start"));
+                return;
+            }
+            beginOnServer(player, goal.immutable(), options, future);
+        };
+        future.whenComplete((result, error) -> {
+            if (future.isCancelled() && server != null) stopOnServer(server, () -> {
+                NavigationSession active = SESSIONS.get(player.getUUID());
+                if (active != null && active.future == future)
+                    finish(active, NavigationResult.Status.CANCELLED, "Navigation future cancelled");
+            });
+        });
         if (server == null) {
             future.complete(new NavigationResult(NavigationResult.Status.PLAYER_UNAVAILABLE,
                     player.blockPosition(), "Server unavailable"));
@@ -79,7 +99,12 @@ public final class NavigationService {
                     player.blockPosition(), "Server unavailable"));
             return future;
         }
+        long version = cancellationVersion(player.getUUID());
         Runnable begin = () -> {
+            if (future.isDone() || !CANCELLATION.isCurrent(player.getUUID(), version)) {
+                future.complete(new NavigationResult(NavigationResult.Status.CANCELLED, player.blockPosition(), "Override cancelled"));
+                return;
+            }
             NavigationSession session = SESSIONS.get(player.getUUID());
             if (session == null) {
                 beginOnServer(player, goal.immutable(), options, future);
@@ -176,26 +201,39 @@ public final class NavigationService {
         return server == null ? null : server.getPlayerList().getPlayer(botId);
     }
 
+    /** Cancellation returns only after server-owned movement inputs have been released. */
+    private static void stopOnServer(MinecraftServer server, Runnable stop) {
+        if (server.isSameThread()) stop.run();
+        else CompletableFuture.runAsync(stop, server).join();
+    }
+
     public static void cancel(UUID botId, String reason) {
         NavigationSession session = SESSIONS.get(botId);
         if (session != null) cancel(session.server, botId, reason);
+        else CANCELLATION.cancel(botId);
     }
 
     public static void cancel(MinecraftServer server, UUID botId, String reason) {
+        CANCELLATION.cancel(botId);
+        long cancelledVersion = cancellationVersion(botId);
         Runnable cancel = () -> {
             NavigationSession session = SESSIONS.get(botId);
-            if (session != null) finish(session, NavigationResult.Status.CANCELLED, reason);
+            if (session != null && session.cancellationVersion < cancelledVersion)
+                finish(session, NavigationResult.Status.CANCELLED, reason);
         };
-        if (server.isSameThread()) cancel.run(); else server.execute(cancel);
+        stopOnServer(server, cancel);
     }
 
     public static void cancelAll(MinecraftServer server, String reason) {
-        Runnable cancel = () -> new ArrayList<>(SESSIONS.values())
+        CANCELLATION.cancelAll();
+        Runnable cancel = () -> new ArrayList<>(SESSIONS.values()).stream()
+                .filter(session -> session.server == server && !CANCELLATION.isCurrent(session.botId, session.cancellationVersion))
                 .forEach(session -> finish(session, NavigationResult.Status.CANCELLED, reason));
-        if (server.isSameThread()) cancel.run(); else server.execute(cancel);
+        stopOnServer(server, cancel);
     }
 
     public static void cancelAll(String reason) {
+        CANCELLATION.cancelAll();
         Set<MinecraftServer> servers = new HashSet<>();
         for (NavigationSession session : SESSIONS.values()) servers.add(session.server);
         for (MinecraftServer server : servers) cancelAll(server, reason);
@@ -203,6 +241,7 @@ public final class NavigationService {
 
     private static void beginOnServer(ServerPlayer player, BlockPos goal, NavigationOptions options,
                                       CompletableFuture<NavigationResult> future) {
+        if (future.isDone()) return;
         NavigationSession previous = SESSIONS.get(player.getUUID());
         if (previous != null) finish(previous, NavigationResult.Status.CANCELLED, "Replaced by a newer route");
         if (!player.isAlive() || player.hasDisconnected()) {
@@ -221,6 +260,10 @@ public final class NavigationService {
         List<NavigationSession> planners = new ArrayList<>();
         for (NavigationSession session : new ArrayList<>(SESSIONS.values())) {
             if (SESSIONS.get(session.botId) != session) continue;
+            if (session.future.isDone() || !CANCELLATION.isCurrent(session.botId, session.cancellationVersion)) {
+                finish(session, NavigationResult.Status.CANCELLED, "Request cancelled");
+                continue;
+            }
             ServerPlayer player = server.getPlayerList().getPlayer(session.botId);
             if (player == null || !player.isAlive() || player.hasDisconnected()) {
                 finish(session, NavigationResult.Status.PLAYER_UNAVAILABLE, "Player became unavailable");
@@ -278,7 +321,8 @@ public final class NavigationService {
         for (int visited = 0; visited < planners.size() && budget > 0 && System.nanoTime() < deadline; visited++) {
             int index = (start + visited) % planners.size();
             NavigationSession session = planners.get(index);
-            if (SESSIONS.get(session.botId) != session || session.search == null) continue;
+            if (SESSIONS.get(session.botId) != session || session.search == null || session.future.isDone()
+                    || !CANCELLATION.isCurrent(session.botId, session.cancellationVersion)) continue;
             ServerPlayer player = server.getPlayerList().getPlayer(session.botId);
             if (player == null) continue;
             int share = shares[index];
@@ -494,6 +538,10 @@ public final class NavigationService {
 
     private static void startPlanning(NavigationSession session, ServerPlayer player, ReplanReason reason) {
         if (SESSIONS.get(session.botId) != session) return;
+        if (session.future.isDone() || !CANCELLATION.isCurrent(session.botId, session.cancellationVersion)) {
+            finish(session, NavigationResult.Status.CANCELLED, "Request cancelled before replanning");
+            return;
+        }
         if (reason != ReplanReason.INITIAL && session.override == null) {
             double distance = player.position().distanceTo(Vec3.atBottomCenterOf(session.goal));
             if (session.replans.record(distance, reason)) {
@@ -551,6 +599,17 @@ public final class NavigationService {
     }
 
     private static void reachCurrentObjective(NavigationSession session, ServerPlayer player, String message) {
+        if (!CANCELLATION.isCurrent(session.botId, session.cancellationVersion) || session.future.isDone()) {
+            finish(session, NavigationResult.Status.CANCELLED, "Request cancelled");
+            return;
+        }
+        if (!destinationReached(player.position(), session.effectiveGoal)
+                || !player.level().noBlockCollision(player, player.getBoundingBox(), false)
+                || session.path.isEmpty()
+                || !PathFinder.isWaypointStillValid(player.level(), session.path.getLast())) {
+            failCurrentObjective(session, player, NavigationResult.Status.STUCK, "Destination was not reached or is no longer valid");
+            return;
+        }
         if (session.override == null) {
             finish(session, NavigationResult.Status.REACHED, message);
             return;
@@ -560,6 +619,10 @@ public final class NavigationService {
         completed.future.complete(new NavigationResult(NavigationResult.Status.REACHED,
                 player.blockPosition(), message));
         startPlanning(session, player, ReplanReason.OVERRIDE_COMPLETED);
+    }
+
+    static boolean destinationReached(Vec3 actual, Vec3 destination) {
+        return destination != null && actual.distanceTo(destination) <= 1.0;
     }
 
     private static void failCurrentObjective(NavigationSession session, ServerPlayer player,
@@ -639,6 +702,7 @@ public final class NavigationService {
     }
 
     private static final class NavigationSession {
+        final long cancellationVersion;
         final UUID botId;
         final MinecraftServer server;
         final ResourceKey<Level> dimension;
@@ -671,6 +735,7 @@ public final class NavigationService {
         NavigationSession(ServerPlayer player, BlockPos goal, NavigationOptions options, long generation,
                           CompletableFuture<NavigationResult> future) {
             this.botId = player.getUUID();
+            this.cancellationVersion = NavigationService.cancellationVersion(botId);
             this.server = Objects.requireNonNull(player.level().getServer());
             this.dimension = player.level().dimension();
             this.goal = goal;

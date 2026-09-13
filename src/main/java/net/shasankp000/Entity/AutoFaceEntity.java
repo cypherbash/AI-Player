@@ -321,7 +321,7 @@ public class AutoFaceEntity {
                         );
                     }
 
-                    if ((NavigationService.isNavigating(bot.getUUID()) || isBotMoving) || blockDetectionUnit.getBlockDetectionStatus() || isBotExecutingTask()) {
+                    if ((NavigationService.isNavigating(bot.getUUID()) || isBotMoving) || blockDetectionUnit.getBlockDetectionStatus() || isBotExecutingTask() || net.shasankp000.FunctionCaller.FunctionCallerV2.isExecuting(bot.getUUID())) {
 
                         System.out.println("Hostile mobs detected while bot is executing jobs!");
 
@@ -467,7 +467,7 @@ public class AutoFaceEntity {
                     // first check if bot is moving, and if so, then stop moving.
                     // the hope is that the bot will stop moving ahead of time since the danger zone detector has a wide range.
 
-                    if (NavigationService.isNavigating(bot.getUUID()) || isBotMoving || isBotExecutingTask()) {
+                    if (NavigationService.isNavigating(bot.getUUID()) || isBotMoving || isBotExecutingTask() || net.shasankp000.FunctionCaller.FunctionCallerV2.isExecuting(bot.getUUID())) {
 
                         System.out.println("Stopping movement since danger zone is detected.");
 
@@ -541,12 +541,12 @@ public class AutoFaceEntity {
                     // Safe nighttime has no combat trigger, so explicitly let the
                     // learned policy evaluate its SLEEP action while the bot is idle.
                     if (!((NavigationService.isNavigating(bot.getUUID()) || isBotMoving)
-                            || blockDetectionUnit.getBlockDetectionStatus() || isBotExecutingTask())) {
+                            || blockDetectionUnit.getBlockDetectionStatus() || isBotExecutingTask() || net.shasankp000.FunctionCaller.FunctionCallerV2.isExecuting(bot.getUUID()))) {
                         BotEventHandler.considerNightSleep(finalRlAgent, qTable, bot);
                     }
 
                     // Face nearby entities (players, passive mobs, etc.) - but only if bot is NOT busy with tasks
-                    if (!((NavigationService.isNavigating(bot.getUUID()) || isBotMoving) || blockDetectionUnit.getBlockDetectionStatus() || isBotExecutingTask())) {
+                    if (!((NavigationService.isNavigating(bot.getUUID()) || isBotMoving) || blockDetectionUnit.getBlockDetectionStatus() || isBotExecutingTask() || net.shasankp000.FunctionCaller.FunctionCallerV2.isExecuting(bot.getUUID()))) {
                         FaceClosestEntity.faceClosestEntity(bot, nearbyEntities);
 
                         // Feature 5 — Player Proximity Awareness.

@@ -14,7 +14,7 @@ public class ToolRegistry {
                     "goTo",
                     """
                     Uses the path finder and path tracer to navigate to a given x y z coordinate.
-                    Stops within ~3 blocks of the target due to inertia-based carpet bot control.
+                    Completes only after reaching a collision-safe destination. Occupied blocks are approached within mining range.
                     """,
                     List.of(
                             new Tool.Parameter("x", "X coordinate to go to."),
@@ -41,10 +41,9 @@ public class ToolRegistry {
                     ),
                     Set.of("lastDetectedBlock.x", "lastDetectedBlock.y", "lastDetectedBlock.z"),
                     (sharedState, paramMap, result) -> {
+                        SearchResultState.clear(sharedState);
                         if (result instanceof BlockPos pos) {
-                            sharedState.put("lastDetectedBlock.x", pos.getX());
-                            sharedState.put("lastDetectedBlock.y", pos.getY());
-                            sharedState.put("lastDetectedBlock.z", pos.getZ());
+                            SearchResultState.publish(sharedState, pos.getX(), pos.getY(), pos.getZ(), paramMap.get("blockType"));
                         }
                     }
             ),
@@ -113,9 +112,7 @@ public class ToolRegistry {
                     """
                     Retrieves the bot's current oxygen (air) level.
                     """,
-                    List.of(
-                            new Tool.Parameter("None", "No parameters needed.")
-                    ),
+                    List.of(),
                     Set.of("bot.oxygenLevel"),
                     (sharedState, paramMap, result) -> {
                         if (result instanceof Number level) {
@@ -133,9 +130,7 @@ public class ToolRegistry {
                     """
                     Gets the bot's hunger level.
                     """,
-                    List.of(
-                            new Tool.Parameter("None", "No parameters needed.")
-                    ),
+                    List.of(),
                     Set.of("bot.hungerLevel"),
                     (sharedState, paramMap, result) -> {
                         if (result instanceof Number level) {
@@ -151,9 +146,7 @@ public class ToolRegistry {
                     """
                     Gets the bot's health level (hearts).
                     """,
-                    List.of(
-                            new Tool.Parameter("None", "No parameters needed.")
-                    ),
+                    List.of(),
                     Set.of("bot.healthLevel"),
                     (sharedState, paramMap, result) -> {
                         if (result instanceof Number level) {
@@ -183,7 +176,7 @@ public class ToolRegistry {
                     Searches the web for the input query via an automatically pre-configured provider. Meant to be used as a standalone method and not in a pipeline.
                     """,
                     List.of(
-                            new Tool.Parameter("Query", "You need to understand the user's input and put in a search query accordingly in here.")
+                            new Tool.Parameter("query", "You need to understand the user's input and put in a search query accordingly in here.")
                     ),
                     Set.of("webSearchQuery.result"),
                     ((sharedState, paramMap, searchResult) -> {
@@ -229,13 +222,11 @@ public class ToolRegistry {
                             new Tool.Parameter("maxRadius", "Maximum search radius in blocks (e.g., 100)."),
                             new Tool.Parameter("radiusIncrement", "How much to expand each iteration (e.g., 20).")
                     ),
-                    Set.of("foundBlock.x", "foundBlock.y", "foundBlock.z", "foundBlock.type"),
+                    Set.of("lastDetectedBlock.x", "lastDetectedBlock.y", "lastDetectedBlock.z", "foundBlock.type"),
                     (sharedState, paramMap, result) -> {
+                        SearchResultState.clear(sharedState);
                         if (result instanceof BlockPos pos) {
-                            sharedState.put("foundBlock.x", pos.getX());
-                            sharedState.put("foundBlock.y", pos.getY());
-                            sharedState.put("foundBlock.z", pos.getZ());
-                            sharedState.put("foundBlock.type", paramMap.get("blockType"));
+                            SearchResultState.publish(sharedState, pos.getX(), pos.getY(), pos.getZ(), paramMap.get("blockType"));
                         }
                     }
             )

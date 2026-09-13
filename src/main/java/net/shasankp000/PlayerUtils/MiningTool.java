@@ -49,6 +49,11 @@ public final class MiningTool {
     }
 
     public static CompletableFuture<MiningResult> mineBlock(ServerPlayer bot, BlockPos targetBlockPos) {
+        return mineBlock(bot, targetBlockPos, () -> true);
+    }
+
+    public static CompletableFuture<MiningResult> mineBlock(ServerPlayer bot, BlockPos targetBlockPos,
+                                                            java.util.function.BooleanSupplier active) {
         if (bot == null || targetBlockPos == null) {
             return CompletableFuture.completedFuture(MiningResult.failure(
                     MiningResult.Status.INVALID_TARGET, targetBlockPos, "Bot and target are required"));
@@ -64,7 +69,15 @@ public final class MiningTool {
         long generation = GENERATIONS.incrementAndGet();
         BlockPos target = targetBlockPos.immutable();
         CompletableFuture<MiningResult> future = new CompletableFuture<>();
-        Runnable begin = () -> beginSafely(server, botId, target, generation, future);
+        Runnable begin = () -> {
+            if (!active.getAsBoolean()) {
+                future.complete(MiningResult.failure(MiningResult.Status.CANCELLED, target, "Execution cancelled"));
+                return;
+            }
+            beginSafely(server, botId, target, generation, future);
+            MiningSession session = SESSIONS.get(botId);
+            if (session != null && session.generation == generation) session.active = active;
+        };
 
         try {
             if (server.isSameThread()) begin.run();
@@ -204,6 +217,10 @@ public final class MiningTool {
         for (MiningSession session : new ArrayList<>(SESSIONS.values())) {
             if (session.server != server || SESSIONS.get(session.botId) != session) continue;
             try {
+                if (!session.active.getAsBoolean()) {
+                    finish(session, MiningResult.failure(MiningResult.Status.CANCELLED, session.target, "Execution cancelled"));
+                    continue;
+                }
                 if (session.future.isDone()) {
                     finish(session, null);
                     continue;
@@ -333,6 +350,7 @@ public final class MiningTool {
     }
 
     private static final class MiningSession {
+        java.util.function.BooleanSupplier active = () -> true;
         final UUID botId;
         final MinecraftServer server;
         final ResourceKey<Level> dimension;

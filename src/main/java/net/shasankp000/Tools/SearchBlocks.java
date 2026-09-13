@@ -20,25 +20,7 @@ import net.minecraft.world.level.block.state.BlockState;
 public class SearchBlocks {
     private static final Logger LOGGER = LoggerFactory.getLogger("search-blocks");
 
-    // Cache of already searched positions to avoid re-scanning
-    private static final Map<UUID, Set<BlockPos>> searchedPositions = new ConcurrentHashMap<>();
-
-    // Thread pool for parallel searching
-    private static final ExecutorService searchExecutor = Executors.newFixedThreadPool(
-        Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
-        r -> {
-            Thread t = new Thread(r, "BlockSearch-Worker");
-            t.setDaemon(true);
-            return t;
-        }
-    );
-
-    // Maximum blocks to check per iteration to prevent lag
     private static final int MAX_BLOCKS_PER_ITERATION = 5000;
-
-    // Clean up old search caches periodically
-    private static long lastCleanup = System.currentTimeMillis();
-    private static final long CLEANUP_INTERVAL = 300000; // 5 minutes
 
     /**
      * Search for a specific block type in an expanding radius.
@@ -62,16 +44,15 @@ public class SearchBlocks {
             return null;
         }
 
-        // Periodic cleanup of old caches
-        cleanupOldCaches();
+        if (initialRadius <= 0 || maxRadius < initialRadius || maxRadius > 128 || radiusIncrement <= 0)
+            throw new IllegalArgumentException("Invalid bounded search radii");
 
         ServerLevel world = bot.level();
         BlockPos botPos = bot.blockPosition();
         UUID botId = bot.getUUID();
 
         // Initialize search cache for this bot if needed
-        searchedPositions.putIfAbsent(botId, ConcurrentHashMap.newKeySet());
-        Set<BlockPos> searched = searchedPositions.get(botId);
+        Set<BlockPos> searched = new HashSet<>();
 
         // Normalize block type
         String normalizedBlockType = normalizeBlockType(blockType);
@@ -88,9 +69,10 @@ public class SearchBlocks {
         // Search in expanding shells
         int currentRadius = initialRadius;
 
-        while (currentRadius <= maxRadius) {
+        int previousRadius = -1;
+        while (true) {
             int finalRadius = currentRadius;
-            int prevRadius = Math.max(0, currentRadius - radiusIncrement);
+            int prevRadius = previousRadius;
 
             LOGGER.debug("Searching shell: inner={}, outer={}", prevRadius, finalRadius);
 
@@ -105,7 +87,9 @@ public class SearchBlocks {
                 return result;
             }
 
-            currentRadius += radiusIncrement;
+            if (currentRadius == maxRadius) break;
+            previousRadius = currentRadius;
+            currentRadius = Math.min(maxRadius, currentRadius + radiusIncrement);
         }
 
         LOGGER.warn("No {} found within {} blocks", normalizedBlockType, maxRadius);
@@ -130,57 +114,37 @@ public class SearchBlocks {
         // Filter out already searched positions
         candidates.removeIf(alreadySearched::contains);
 
-        // Limit to prevent lag
-        if (candidates.size() > MAX_BLOCKS_PER_ITERATION) {
-            LOGGER.debug("Limiting search from {} to {} blocks",
-                candidates.size(), MAX_BLOCKS_PER_ITERATION);
-            candidates = candidates.subList(0, MAX_BLOCKS_PER_ITERATION);
-        }
-
-        if (candidates.isEmpty()) {
-            return null;
-        }
-
-        // Split work into chunks for parallel processing
-        int numThreads = Math.min(4, candidates.size() / 500 + 1);
-        int chunkSize = candidates.size() / numThreads;
-
-        List<CompletableFuture<BlockPos>> futures = new ArrayList<>();
-
-        for (int i = 0; i < numThreads; i++) {
-            int start = i * chunkSize;
-            int end = (i == numThreads - 1) ? candidates.size() : (i + 1) * chunkSize;
-
-            List<BlockPos> chunk = candidates.subList(start, end);
-
-            CompletableFuture<BlockPos> future = CompletableFuture.supplyAsync(() -> {
-                for (BlockPos pos : chunk) {
-                    alreadySearched.add(pos); // Mark as searched
-
-                    BlockState state = world.getBlockState(pos);
-                    if (state.getBlock() == targetBlock) {
-                        return pos; // Found it!
+        // Read live blocks only on the server thread, in bounded batches. No detached search workers.
+        for (int offset = 0; offset < candidates.size(); offset += MAX_BLOCKS_PER_ITERATION) {
+            List<BlockPos> batch = List.copyOf(candidates.subList(offset,
+                    Math.min(candidates.size(), offset + MAX_BLOCKS_PER_ITERATION)));
+            CompletableFuture<BlockPos> result = new CompletableFuture<>();
+            Runnable scan = () -> {
+                if (result.isDone()) return;
+                try {
+                    BlockPos found = null;
+                    for (BlockPos pos : batch) {
+                        alreadySearched.add(pos);
+                        if (world.isLoaded(pos) && world.getBlockState(pos).getBlock() == targetBlock) {
+                            found = pos;
+                            break;
+                        }
                     }
-                }
-                return null;
-            }, searchExecutor);
-
-            futures.add(future);
-        }
-
-        // Wait for first match or all to complete
-        try {
-            for (CompletableFuture<BlockPos> future : futures) {
-                BlockPos result = future.get(5, TimeUnit.SECONDS);
-                if (result != null) {
-                    // Cancel remaining searches
-                    futures.forEach(f -> f.cancel(true));
-                    return result;
-                }
+                    result.complete(found);
+                } catch (Throwable error) { result.completeExceptionally(error); }
+            };
+            if (world.getServer().isSameThread()) scan.run(); else world.getServer().execute(scan);
+            try {
+                BlockPos found = result.get(5, TimeUnit.SECONDS);
+                if (found != null) return found;
+            } catch (InterruptedException error) {
+                result.cancel(false);
+                Thread.currentThread().interrupt();
+                throw new CancellationException("Search interrupted");
+            } catch (ExecutionException | TimeoutException error) {
+                result.cancel(false);
+                throw new CompletionException(error);
             }
-        } catch (InterruptedException | ExecutionException | TimeoutException e) {
-            LOGGER.error("Search interrupted", e);
-            futures.forEach(f -> f.cancel(true));
         }
 
         return null;
@@ -193,7 +157,7 @@ public class SearchBlocks {
     private static List<BlockPos> generateShellPositions(BlockPos center, int innerRadius, int outerRadius) {
         List<BlockPos> positions = new ArrayList<>();
 
-        int innerRadiusSq = innerRadius * innerRadius;
+        int innerRadiusSq = innerRadius < 0 ? -1 : innerRadius * innerRadius;
         int outerRadiusSq = outerRadius * outerRadius;
 
         // Iterate cube, filter to shell
@@ -244,51 +208,12 @@ public class SearchBlocks {
     /**
      * Clear search cache for a specific bot.
      */
-    public static void clearCache(UUID botId) {
-        searchedPositions.remove(botId);
-        LOGGER.debug("Cleared search cache for bot: {}", botId);
-    }
+    public static void clearCache(UUID botId) { /* Searches are request-local. */ }
 
     /**
      * Clear all search caches.
      */
-    public static void clearAllCaches() {
-        searchedPositions.clear();
-        LOGGER.info("Cleared all search caches");
-    }
+    public static void clearAllCaches() { /* Searches are request-local. */ }
 
-    /**
-     * Periodic cleanup of old caches to prevent memory leaks.
-     */
-    private static void cleanupOldCaches() {
-        long now = System.currentTimeMillis();
-        if (now - lastCleanup > CLEANUP_INTERVAL) {
-            // In a real scenario, we'd track last access time per bot
-            // For now, just clear if caches get too large
-            if (searchedPositions.size() > 10) {
-                LOGGER.info("Cleaning up old search caches (total: {})", searchedPositions.size());
-                searchedPositions.entrySet().removeIf(entry -> {
-                    // Remove if cache is very large (bot searched a lot)
-                    return entry.getValue().size() > 50000;
-                });
-            }
-            lastCleanup = now;
-        }
-    }
-
-    /**
-     * Shutdown the search executor (call on mod unload).
-     */
-    public static void shutdown() {
-        searchExecutor.shutdown();
-        try {
-            if (!searchExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
-                searchExecutor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            searchExecutor.shutdownNow();
-        }
-        LOGGER.info("Search executor shut down");
-    }
+    public static void shutdown() { /* No background search workers. */ }
 }
-

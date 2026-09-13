@@ -31,35 +31,8 @@ public class ToolVerifiers {
     // Registry of verifiers per function (extend as needed)
     public static final Map<String, StateVerifier> VERIFIER_REGISTRY = Map.of(
             "goTo", (params, state, bot) -> {
-                Object xObj = state.get("botPosition.x");
-                Object yObj = state.get("botPosition.y");
-                Object zObj = state.get("botPosition.z");
-                if (!(xObj instanceof Number) || !(yObj instanceof Number) || !(zObj instanceof Number)) {
-                    return new VerificationResult(false, Map.of("error", "Missing or invalid position in state"));
-                }
-
-                double actualX = ((Number) xObj).doubleValue();
-                double actualY = ((Number) yObj).doubleValue();
-                double actualZ = ((Number) zObj).doubleValue();
-
-                double targetX = Double.parseDouble(params.getOrDefault("x", "0"));
-                double targetY = Double.parseDouble(params.getOrDefault("y", "0"));
-                double targetZ = Double.parseDouble(params.getOrDefault("z", "0"));
-
-                double distSq = Math.pow(actualX - targetX, 2) + Math.pow(actualY - targetY, 2) + Math.pow(actualZ - targetZ, 2);
-                boolean success = distSq <= 16.0;  // Tolerance for ~4 blocks, accounting for overshoot
-
-                // Optional cross-check with bot's actual position
-                if (bot != null) {
-                    BlockPos botPos = bot.blockPosition();
-                    double botDistSq = Math.pow(botPos.getX() - targetX, 2) + Math.pow(botPos.getY() - targetY, 2) + Math.pow(botPos.getZ() - targetZ, 2);
-                    success = success && botDistSq <= 16.0;
-                }
-
-                Map<String, Object> data = new HashMap<>();
-                data.put("actual", Map.of("x", actualX, "y", actualY, "z", actualZ));
-                data.put("distSq", distSq);
-                return new VerificationResult(success, data);
+                return new VerificationResult(Boolean.TRUE.equals(state.get("navigation.reached")),
+                        Map.of("reached", Boolean.TRUE.equals(state.get("navigation.reached"))));
             },
             "detectBlocks", (params, state, bot) -> {
                 Object x = state.get("lastDetectedBlock.x");

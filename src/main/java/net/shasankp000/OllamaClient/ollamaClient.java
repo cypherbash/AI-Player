@@ -185,11 +185,11 @@ public class ollamaClient {
                 BOT_TASK_POOL.submit(() -> {
                     Thread.currentThread().setName("Function-Caller-Worker");
                     LOGGER.info("\uD83E\uDDF5 Started FunctionCallerV2 worker thread");
-                    new FunctionCallerV2(botSource, playerUUID);
+                    FunctionCallerV2 functionCaller = new FunctionCallerV2(botSource, playerUUID);
                     if (configuredClient != null) {
-                        FunctionCallerV2.run(message, configuredClient);
+                        functionCaller.run(message, configuredClient);
                     } else {
-                        FunctionCallerV2.run(message);
+                        functionCaller.run(message);
                     }
                     LOGGER.info("\u2705 Finished FunctionCallerV2 worker thread");
                 });
@@ -220,11 +220,11 @@ public class ollamaClient {
                     BOT_TASK_POOL.submit(() -> {
                         Thread.currentThread().setName("Function-Caller-Retry-Worker");
                         LOGGER.info("\uD83E\uDDF5 Started FunctionCallerV2 retry worker thread");
-                        new FunctionCallerV2(botSource, playerUUID);
+                        FunctionCallerV2 functionCaller = new FunctionCallerV2(botSource, playerUUID);
                         if (configuredClient != null) {
-                            FunctionCallerV2.run(message, configuredClient);
+                            functionCaller.run(message, configuredClient);
                         } else {
-                            FunctionCallerV2.run(message);
+                            functionCaller.run(message);
                         }
                         LOGGER.info("\u2705 Finished FunctionCallerV2 worker thread");
                     });

@@ -86,7 +86,8 @@ public final class PathFinder {
         private final Map<NavKey, Double> bestOpenG = new HashMap<>();
         private final Set<NavKey> closed = new HashSet<>();
         private final Vec3 requestedGoal;
-        private final Vec3 effectiveGoal;
+        private Vec3 effectiveGoal;
+        private final boolean approach;
         private final Set<BlockPos> penalizedTargets;
         private final GoalDisposition disposition;
         private SearchStatus status = SearchStatus.SEARCHING;
@@ -100,6 +101,8 @@ public final class PathFinder {
             this.requestedGoal = Vec3.atBottomCenterOf(goal);
             HorizonTarget horizonTarget = capToLoadedHorizon(world, startPosition, requestedGoal, horizon);
             Vec3 localGoal = horizonTarget.target();
+            approach = !horizonTarget.capped() && !world.collisionShape(goal).isEmpty()
+                    && world.collisionShape(goal).max(Direction.Axis.Y) >= 1.0 - EPSILON;
             Optional<SearchNode> start = normalizeStart(world, startPosition);
             Optional<NormalizedGoal> normalizedGoal = normalizeGoal(world, BlockPos.containing(localGoal));
             if (start.isEmpty() || normalizedGoal.isEmpty()) {
@@ -130,8 +133,11 @@ public final class PathFinder {
                 Double best = bestOpenG.get(current.key);
                 if (isStaleQueueEntry(current.g, best) || !closed.add(current.key)) continue;
                 bestOpenG.remove(current.key);
-                if (horizontalDistance(current.target, effectiveGoal) <= 0.51
+                if (approach ? current.target.distanceTo(requestedGoal.add(0, 0.5, 0)) <= 2.5
+                        && approachVisible(world, current.target, BlockPos.containing(requestedGoal))
+                        : horizontalDistance(current.target, effectiveGoal) <= 0.51
                         && Math.abs(current.target.y - effectiveGoal.y) <= 0.76) {
+                    if (approach) effectiveGoal = current.target;
                     result = smooth(reconstruct(current), world);
                     status = SearchStatus.FOUND;
                     return status;
@@ -357,6 +363,19 @@ public final class PathFinder {
         BlockPos body = BlockPos.containing(target);
         if (isHazard(world, body) || isWater(world, body)) return Optional.empty();
         return bodyClear(world, target) ? Optional.of(target) : Optional.empty();
+    }
+
+    static boolean approachVisible(NavigationWorldView world, Vec3 feet, BlockPos target) {
+        Vec3 eye = feet.add(0, 1.62, 0);
+        Vec3 center = Vec3.atCenterOf(target);
+        int samples = Math.max(1, (int) Math.ceil(eye.distanceTo(center) * 16));
+        for (int i = 0; i < samples; i++) {
+            Vec3 point = eye.lerp(center, i / (double) samples);
+            if (BlockPos.containing(point).equals(target)) break;
+            if (!world.noBlockCollision(new AABB(point.x - 0.01, point.y - 0.01, point.z - 0.01,
+                    point.x + 0.01, point.y + 0.01, point.z + 0.01))) return false;
+        }
+        return true;
     }
 
     private static boolean bodyClear(NavigationWorldView world, Vec3 feet) {

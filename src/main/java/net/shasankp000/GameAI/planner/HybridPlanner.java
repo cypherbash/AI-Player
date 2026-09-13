@@ -127,10 +127,10 @@ public class HybridPlanner {
             LOGGER.info("[HybridPlanner] Executing plan with {} step(s) for goal '{}'",
                     plan.steps.size(), goalText);
 
-            new net.shasankp000.FunctionCaller.FunctionCallerV2(
+            var functionCaller = new net.shasankp000.FunctionCaller.FunctionCallerV2(
                     bot.createCommandSourceStack().withSuppressedOutput().withMaximumPermission(net.minecraft.server.permissions.PermissionSet.ALL_PERMISSIONS),
                     bot.getUUID());
-            boolean executed = net.shasankp000.FunctionCaller.FunctionCallerV2
+            boolean executed = functionCaller
                     .executePlan(plan, null, currentState)
                     .join();
 
